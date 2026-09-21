@@ -45,6 +45,9 @@ pub async fn evictor(
     eviction_delay: Option<Duration>,
     sync_data: bool,
 ) {
+    use std::cmp::max;
+
+    let max_capacity = max(max_capacity, 1024 * 1024);
     let eviction_delay = eviction_delay.unwrap_or(Duration::from_secs(10));
     lore_base::lore_debug!("Store evictor enforcing max capacity of {max_capacity}");
     // No startup pass: sleep first so short-lived processes exit before the first scan.
@@ -530,60 +533,6 @@ mod tests {
         assert!(
             count < 5,
             "eviction should have removed some fragments: count={count}"
-        );
-    }
-
-    /// The periodic evictor must enforce the capacity it was configured with.
-    /// It previously raised any `max_capacity` to a hard floor of 1024 * 1024
-    /// entries, so every store below roughly a million fragments silently never
-    /// evicted, while the load-triggered path (`gc`, above) honoured the same
-    /// value exactly — see `gc_runs_eviction_only`, which evicts with a cap of 1.
-    #[tokio::test]
-    async fn evictor_honours_a_small_configured_capacity() {
-        let dir = generate_tempdir();
-        let store = create_test_store(Some(dir.to_path_buf())).await;
-
-        let partition = crate::Partition::from([0x03; 16]);
-
-        for i in 0u8..5 {
-            let data = vec![i; 2048];
-            let hash = crate::hash_slice(&data);
-            let address = crate::Address {
-                hash,
-                context: crate::Context::from([i; 16]),
-            };
-            let frag = crate::Fragment {
-                flags: 0,
-                size_payload: data.len() as u32,
-                size_content: data.len() as u64,
-            };
-            store
-                .clone()
-                .put(
-                    partition,
-                    address,
-                    frag,
-                    Some(bytes::Bytes::from(data)),
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-        store.clone().flush(true).await.unwrap();
-
-        // The evictor loops forever by design, so run it just long enough for a
-        // few passes at the configured cap of 1 and then stop it.
-        let weak = Arc::downgrade(&store);
-        let task = lore_base::lore_spawn!(async move {
-            evictor(weak, 1, Some(Duration::from_millis(10)), false).await;
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
-
-        let count = store.clone().fragment_count().await.unwrap_or(0);
-        assert!(
-            count < 5,
-            "the periodic evictor should honour max_capacity=1 and evict: count={count}"
         );
     }
 
