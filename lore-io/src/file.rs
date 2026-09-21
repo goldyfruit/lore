@@ -146,6 +146,52 @@ impl IoFile {
         &self.driver
     }
 
+    /// Releases the filesystem blocks backing `len` bytes at `offset`, leaving the
+    /// file's length unchanged.
+    ///
+    /// Reads of the range afterwards return zeros, exactly as if zeros had been
+    /// written over it — the difference is that the space goes back to the
+    /// filesystem instead of staying allocated. Whole blocks inside the range are
+    /// deallocated and partial blocks at its edges are zeroed, so a range shorter
+    /// than one block frees nothing and only zeroes, which is still correct.
+    ///
+    /// Synchronous, and the one blocking call on this type: this crate depends on no
+    /// async runtime, so a caller that must not block offloads it to whichever one it
+    /// runs under.
+    ///
+    /// Returns [`std::io::ErrorKind::Unsupported`] where the platform or filesystem
+    /// has no such operation; callers needing the range zeroed regardless should fall
+    /// back to writing zeros.
+    pub fn punch_hole(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: the fd is owned by `self.file`, which outlives this call.
+            let result = unsafe {
+                libc::fallocate(
+                    self.file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (offset, len);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "hole punching is not available on this platform",
+            ))
+        }
+    }
+
     /// Reads up to `max_len` bytes at `offset`, returning what arrived. Fewer than `max_len` means
     /// the file ended; empty means the offset was already at or past the end.
     ///
