@@ -3898,6 +3898,62 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         .into()
     }
 
+    async fn sweep_unreferenced(
+        self: Arc<Self>,
+        live: &std::collections::HashSet<Address>,
+        dry_run: bool,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(usize, usize), StoreError> {
+        // Collect first, obliterate after: `obliterate` takes bucket locks itself, so
+        // deleting while holding a read guard would deadlock.
+        let mut scanned = 0usize;
+        let mut collectable: Vec<(Partition, Address)> = Vec::new();
+
+        for group in self.group.iter() {
+            if self.gc_stop_requested() {
+                break;
+            }
+            let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            for bucket_index in 0..active_buckets {
+                let Some(bucket_ref) = group.try_bucket(bucket_index) else {
+                    continue;
+                };
+                let bucket = bucket_ref.read().await;
+                for entry in bucket.entry.iter() {
+                    scanned += 1;
+                    if !live.contains(&entry.address) {
+                        collectable.push((entry.partition, entry.address));
+                    }
+                }
+            }
+        }
+
+        let collected = collectable.len();
+        if dry_run {
+            lore_base::lore_debug!(
+                "Reachability sweep (dry run): {scanned} scanned, {collected} collectable"
+            );
+            return Ok((scanned, collected));
+        }
+
+        for (partition, address) in collectable {
+            if self.gc_stop_requested() {
+                break;
+            }
+            if let Err(err) = self
+                .clone()
+                .obliterate(partition, address, stats.clone())
+                .await
+            {
+                lore_base::lore_warn!("Reachability sweep failed to obliterate: {err}");
+            }
+        }
+        lore_base::lore_debug!(
+            "Reachability sweep: {scanned} scanned, {collected} obliterated"
+        );
+        Ok((scanned, collected))
+    }
+
     async fn evict(
         self: Arc<Self>,
         max_capacity: usize,

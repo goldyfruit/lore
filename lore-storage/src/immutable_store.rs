@@ -525,6 +525,29 @@ pub trait ImmutableStore: Any + Send + Sync {
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError>;
 
+    /// Sweep the store against a set of reachable addresses, obliterating every
+    /// fragment that is not in it.
+    ///
+    /// This is the reference-aware counterpart to [`Self::evict`]: eviction ranks by
+    /// last access and capacity and will happily drop fragments a repository still
+    /// needs, which makes it unusable where the store is the source of truth rather
+    /// than a cache. The caller is responsible for `live` being complete — a missing
+    /// address here means data loss — so implementations must honour `dry_run`,
+    /// which counts what would be collected and changes nothing.
+    ///
+    /// Returns `(scanned, collected)`.
+    ///
+    /// The default reports nothing swept, for stores that cannot enumerate their
+    /// contents (remote, replica and composite stores).
+    async fn sweep_unreferenced(
+        self: Arc<Self>,
+        _live: &std::collections::HashSet<Address>,
+        _dry_run: bool,
+        _stats: Arc<StoreObliterateStats>,
+    ) -> Result<(usize, usize), StoreError> {
+        Ok((0, 0))
+    }
+
     /// Evict fragments from the store until the given max capacity is reached.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
     /// `sink`, when present, receives eviction lifecycle and per-bucket progress.
