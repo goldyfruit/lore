@@ -39,6 +39,8 @@ pub struct GcReport {
     pub live_addresses: usize,
     pub scanned: usize,
     pub collected: usize,
+    /// Unreferenced but inside the grace window, so deliberately left this pass.
+    pub protected: usize,
     pub dry_run: bool,
 }
 
@@ -189,6 +191,7 @@ pub async fn run(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     dry_run: bool,
+    grace_seconds: u64,
 ) -> Result<GcReport, String> {
     let mut report = GcReport {
         dry_run,
@@ -203,12 +206,13 @@ pub async fn run(
     .await?;
 
     let stats = Arc::new(StoreObliterateStats::default());
-    let (scanned, collected) = immutable_store
-        .sweep_unreferenced(&live, dry_run, stats)
+    let sweep = immutable_store
+        .sweep_unreferenced(&live, dry_run, grace_seconds, stats)
         .await
         .map_err(|err| format!("sweep failed: {err}"))?;
 
-    report.scanned = scanned;
-    report.collected = collected;
+    report.scanned = sweep.scanned;
+    report.collected = sweep.collected;
+    report.protected = sweep.protected;
     Ok(report)
 }

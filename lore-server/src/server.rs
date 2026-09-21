@@ -1852,8 +1852,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         let gc_mutable = mutable_store.clone();
         let interval = Duration::from_secs(gc_settings.interval_seconds.max(1));
         info!(
-            "Reachability GC enabled: every {}s, dry_run={}",
-            gc_settings.interval_seconds, gc_settings.dry_run
+            "Reachability GC enabled: every {}s, dry_run={}, grace={}s",
+            gc_settings.interval_seconds, gc_settings.dry_run, gc_settings.grace_seconds
         );
         drop(lore_base::lore_spawn!(async move {
             loop {
@@ -1862,17 +1862,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     gc_immutable.clone(),
                     gc_mutable.clone(),
                     gc_settings.dry_run,
+                    gc_settings.grace_seconds,
                 )
                 .await
                 {
                     Ok(report) => info!(
-                        "Reachability GC pass: repositories={} branches={} revisions={} live={} scanned={} collected={} dry_run={}",
+                        "Reachability GC pass: repositories={} branches={} revisions={} live={} scanned={} collected={} protected={} dry_run={}",
                         report.repositories,
                         report.branches,
                         report.revisions,
                         report.live_addresses,
                         report.scanned,
                         report.collected,
+                        report.protected,
                         report.dry_run
                     ),
                     // A failed walk cannot prove reachability, so the pass deletes nothing.

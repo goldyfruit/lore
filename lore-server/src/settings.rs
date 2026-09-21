@@ -449,6 +449,16 @@ pub struct GcSettings {
     /// Seconds between passes.
     #[serde(default = "default_gc_interval")]
     pub interval_seconds: u64,
+    /// Protect fragments touched within this many seconds. The mark and the sweep
+    /// are not atomic, so a push running alongside a pass can write or reference
+    /// fragments the mark never saw; leaving recently-touched fragments for a later
+    /// pass closes that race without blocking writers.
+    #[serde(default = "default_gc_grace")]
+    pub grace_seconds: u64,
+}
+
+fn default_gc_grace() -> u64 {
+    3600
 }
 
 fn default_gc_dry_run() -> bool {
