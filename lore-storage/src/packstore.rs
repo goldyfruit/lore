@@ -636,7 +636,6 @@ impl PackStore {
     pub async fn obliterate(&self, id: u32, offset: u32, size: u32) -> Result<(), PackfileError> {
         let offset = offset as usize;
         let size = size as usize;
-        let zeros = BytesMut::zeroed(size).freeze();
 
         let mut packfiles = self.packfile.read().await;
         if packfiles.is_empty() {
@@ -658,7 +657,33 @@ impl PackStore {
         packfile.dirty.store(true, Ordering::Relaxed);
 
         if let Some(file) = packfile.file.as_ref() {
-            packfile_write(file, zeros, offset).await?;
+            // Punching a hole leaves the same bytes readable — zeros — but returns the
+            // blocks to the filesystem, where overwriting with zeros keeps them
+            // allocated and the store never shrinks. Whole blocks inside the range go,
+            // partial blocks at the edges are zeroed, so the result a reader sees is
+            // identical either way.
+            let punched = {
+                let file = file.clone();
+                let offset = offset as u64;
+                let size = size as u64;
+                tokio::task::spawn_blocking(move || file.punch_hole(offset, size))
+                    .await
+                    .unwrap_or_else(|err| {
+                        Err(std::io::Error::other(format!("punch task failed: {err}")))
+                    })
+            };
+
+            // Filesystems without hole punching answer `Unsupported`; the payload still
+            // has to read back as zeros, so fall back to writing them.
+            if let Err(err) = punched {
+                lore_base::lore_debug!(
+                    "Hole punch unavailable ({err}), zeroing payload instead; space will not be reclaimed"
+                );
+                // Allocated only on this path: a successful punch needs no buffer,
+                // and a payload can be large.
+                let zeros = BytesMut::zeroed(size).freeze();
+                packfile_write(file, zeros, offset).await?;
+            }
             let _ = file.sync_data().await;
         }
 
