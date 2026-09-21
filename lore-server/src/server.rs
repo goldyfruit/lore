@@ -1843,6 +1843,45 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
+    // Reachability-based collection. Off unless configured, and a dry run unless the
+    // operator explicitly turns that off, because an incomplete mark deletes live data.
+    if let Some(gc_settings) = settings.server.gc.clone()
+        && gc_settings.enabled
+    {
+        let gc_immutable = immutable_store.clone();
+        let gc_mutable = mutable_store.clone();
+        let interval = Duration::from_secs(gc_settings.interval_seconds.max(1));
+        info!(
+            "Reachability GC enabled: every {}s, dry_run={}",
+            gc_settings.interval_seconds, gc_settings.dry_run
+        );
+        drop(lore_base::lore_spawn!(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match crate::gc::run(
+                    gc_immutable.clone(),
+                    gc_mutable.clone(),
+                    gc_settings.dry_run,
+                )
+                .await
+                {
+                    Ok(report) => info!(
+                        "Reachability GC pass: repositories={} branches={} revisions={} live={} scanned={} collected={} dry_run={}",
+                        report.repositories,
+                        report.branches,
+                        report.revisions,
+                        report.live_addresses,
+                        report.scanned,
+                        report.collected,
+                        report.dry_run
+                    ),
+                    // A failed walk cannot prove reachability, so the pass deletes nothing.
+                    Err(err) => warn!("Reachability GC pass aborted without collecting: {err}"),
+                }
+            }
+        }));
+    }
+
     let connection_close_timeout =
         Duration::from_secs(settings.server.connection_close_timeout_seconds as u64);
 
