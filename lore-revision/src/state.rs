@@ -8051,7 +8051,13 @@ async fn collect_new_revision_metadata_fragments(
     Ok(addresses)
 }
 
-async fn collect_new_addresses(
+/// Expand `addresses` into the addresses actually stored for them, following
+/// `PayloadFragmented` payloads down to their sub-fragments.
+///
+/// A caller that needs the full set an address stands for — reachability
+/// collection, for one — cannot use the address alone: a fragmented payload
+/// keeps its bytes under sub-addresses that the top-level address only names.
+pub async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
     ignore_durably_stored: bool,

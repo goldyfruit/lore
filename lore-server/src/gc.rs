@@ -42,6 +42,24 @@ pub struct GcReport {
     pub dry_run: bool,
 }
 
+/// Mark `address` and, when its payload is fragmented, the sub-fragments holding
+/// its bytes. Marking the top-level address alone leaves those sweepable, which
+/// is a repository that loads until the first read of its metadata.
+async fn mark_expanded(
+    repo: &Arc<RepositoryContext>,
+    address: Address,
+    live: &mut HashSet<Address>,
+) -> Result<(), String> {
+    match state::collect_new_addresses(repo.clone(), &[address], false).await {
+        Ok(expanded) => {
+            live.extend(expanded);
+            live.insert(address);
+            Ok(())
+        }
+        Err(err) => Err(format!("failed to expand {address}: {err}")),
+    }
+}
+
 /// Collect every address reachable from any repository, branch and revision.
 ///
 /// Collecting against a default (empty) parent state asks for the whole set a
@@ -65,8 +83,28 @@ pub async fn collect_live_addresses(
         .map_err(|err| format!("failed to list repositories: {err}"))?;
 
     while let Some(id) = repositories.next().await {
+        // Deleting a repository leaves a zero id in the listing. It is not a
+        // repository and owns no fragments, so skipping it is safe — whereas
+        // failing the walk on it would stop collection entirely after any delete.
+        if id.is_zero() {
+            lore_base::lore_debug!("GC mark: skipping zero repository id (deleted repository)");
+            continue;
+        }
         report.repositories += 1;
         let repo = Arc::new(root.to_server_context(id.into()));
+
+        // The repository's own metadata fragment is reachable but named by neither a
+        // branch nor a revision, so nothing above would have marked it.
+        match repository::metadata_hash(repo.clone()).await {
+            Ok(hash) if !hash.is_zero() => {
+                lore_base::lore_debug!("GC mark: repository {id} metadata {hash}");
+                mark_expanded(&repo, Address::zero_context_hash(hash), &mut live).await?;
+            }
+            Ok(_) => lore_base::lore_debug!("GC mark: repository {id} has no metadata hash"),
+            Err(err) => {
+                return Err(format!("failed to load metadata hash for {id}: {err}"));
+            }
+        }
 
         let mut branches = match branch::list(repo.clone()).await {
             Ok(branches) => branches,
@@ -78,6 +116,19 @@ pub async fn collect_live_addresses(
 
         while let Some(branch_id) = branches.next().await {
             report.branches += 1;
+
+            // Likewise a branch's metadata fragment: the revision walk names the
+            // revisions a branch points at, never the branch record itself.
+            match branch::metadata_hash(repo.clone(), branch_id.into()).await {
+                Ok(hash) if !hash.is_zero() => {
+                    lore_base::lore_debug!("GC mark: branch {branch_id} metadata {hash}");
+                    mark_expanded(&repo, Address::zero_context_hash(hash), &mut live).await?;
+                }
+                Ok(_) => lore_base::lore_debug!("GC mark: branch {branch_id} has no metadata hash"),
+                Err(err) => {
+                    return Err(format!("failed to load branch metadata for {branch_id}: {err}"));
+                }
+            }
 
             let revisions =
                 match branch::list_revisions(repo.clone(), Some(branch_id), None, None, None).await
@@ -92,6 +143,17 @@ pub async fn collect_live_addresses(
             for item in revisions.revisions.iter() {
                 report.revisions += 1;
                 let revision = item.revision;
+
+                // The revision record itself, and the parents it names. Collecting
+                // against a default from-state does not reliably yield these, and a
+                // revision whose own record is swept is a revision that cannot load.
+                live.insert(Address::zero_context_hash(revision));
+                if !item.parent_self.is_zero() {
+                    live.insert(Address::zero_context_hash(item.parent_self));
+                }
+                if !item.parent_other.is_zero() {
+                    live.insert(Address::zero_context_hash(item.parent_other));
+                }
                 let state = match State::deserialize(repo.clone(), revision).await {
                     Ok(state) => state,
                     Err(err) => {
@@ -103,7 +165,13 @@ pub async fn collect_live_addresses(
 
                 let empty = Arc::new(State::default());
                 match state::collect_new_fragments(repo.clone(), empty, state, false).await {
-                    Ok(addresses) => live.extend(addresses),
+                    Ok(addresses) => {
+                        lore_base::lore_debug!(
+                            "GC mark: revision {revision} contributed {} addresses",
+                            addresses.len()
+                        );
+                        live.extend(addresses);
+                    }
                     Err(err) => {
                         return Err(format!("failed to collect fragments for {revision}: {err}"));
                     }
