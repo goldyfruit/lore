@@ -3933,6 +3933,13 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             lore_base::lore_debug!(
                 "Reachability sweep (dry run): {scanned} scanned, {collected} collectable"
             );
+            // Naming them is what makes an incomplete mark diagnosable rather than
+            // just a number; a complete mark on an all-live store prints nothing.
+            for (partition, address) in collectable.iter().take(16) {
+                lore_base::lore_debug!(
+                    "Reachability sweep would collect {address} in partition {partition}"
+                );
+            }
             return Ok((scanned, collected));
         }
 
