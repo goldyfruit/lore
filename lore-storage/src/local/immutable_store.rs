@@ -123,6 +123,22 @@ impl ImmutableData {
     /// deduplicated payload as another fragment. Synchronizes `PayloadStoredLocal` with the
     /// resulting `pack_file` so the flag and the pointer it describes always agree.
     fn assign_deduplicated_payload(&mut self, deduplicated: ImmutableData) {
+        // A tombstone never adopts a payload. `obliterate` deliberately destroys a fragment's
+        // bytes and rewrites its entry as `PayloadObliterated` with `size_content: 0`, so the
+        // "every entry sharing this hash should point at the same payload" upgrade that callers
+        // perform must pass it by: a tombstone's pack pointer ALWAYS differs from a live one
+        // (`pack_file == 0`), so it matches their "needs upgrading" test every time.
+        //
+        // Without this guard, re-putting content whose fragments the collector has already
+        // reclaimed makes a dead entry point at live bytes while still claiming zero content —
+        // which is precisely the inconsistency the assertion below exists to catch, and it does:
+        // the server aborts (`panic = "abort"` in the release profile, which also keeps
+        // `debug-assertions = true`) and comes back to do it again on the next push of the same
+        // content. Reviving a tombstone is the business of a real `store()` of that tuple, which
+        // replaces the entry wholesale and never arrives here.
+        if self.flags & FragmentFlags::PayloadObliterated.bits() != 0 {
+            return;
+        }
         debug_assert!(
             self.size_content == deduplicated.size_content,
             "Invalid deduplication, content size do not match"
@@ -6911,6 +6927,98 @@ mod tests {
             StoreMatch::MatchNone,
             "reopening the store loaded back the association healing removed"
         );
+    }
+
+    /// Re-putting content the collector already reclaimed must not resurrect its tombstone.
+    ///
+    /// `store` ends by walking every entry that shares the new fragment's HASH and pointing the
+    /// ones whose pack pointer differs at the new payload, so that a hash stored twice is only
+    /// held once. A tombstone always qualifies — `obliterate` sets `pack_file: 0` — so before the
+    /// guard in `assign_deduplicated_payload` this made a dead entry adopt live bytes while still
+    /// reporting `size_content: 0`, tripping that function's own assertion. With
+    /// `debug-assertions = true` and `panic = "abort"` in the release profile that is not a
+    /// warning: the server aborts, restarts, and aborts again the next time the same content is
+    /// pushed. Reproduced against production 2026-09-22 (16 restarts, exit 139) after the
+    /// reachability collector made obliteration routine rather than rare.
+    #[tokio::test]
+    async fn re_putting_reclaimed_content_leaves_the_tombstone_dead() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_tombstone_dedup_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let payload = Bytes::from_static(b"content the collector reclaims and a client re-pushes");
+        let hash = crate::hash::hash_slice(payload.as_ref());
+        let partition = Partition::from([0x91u8; 16]);
+        // Same content, so the same hash, under two different addresses: this is what puts a
+        // tombstone and a live entry in one bucket and makes the upgrade loop walk across them.
+        let collected = Address { hash, context: Context::from([0x92u8; 16]) };
+        let repushed = Address { hash, context: Context::from([0x93u8; 16]) };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(partition, collected, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put the fragment the collector will reclaim");
+
+        store
+            .clone()
+            .obliterate(
+                partition,
+                collected,
+                Arc::new(crate::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate it");
+
+        // The put that used to abort the process.
+        store
+            .clone()
+            .put(partition, repushed, fragment, Some(payload.clone()), false)
+            .await
+            .expect("re-putting the same content must not abort");
+
+        let tombstone = store
+            .clone()
+            .find(partition, collected)
+            .await
+            .expect("the tombstone is still in the index");
+        assert_ne!(
+            tombstone.data.flags & FragmentFlags::PayloadObliterated.bits(),
+            0,
+            "the re-put revived a fragment the collector had deliberately reclaimed"
+        );
+        assert_eq!(
+            tombstone.data.pack_file, 0,
+            "a tombstone adopted a payload and now points at live bytes"
+        );
+        assert_eq!(
+            tombstone.data.size_content, 0,
+            "a tombstone that claims content is the inconsistency the assertion catches"
+        );
+
+        // And the fragment that WAS pushed is intact, so the guard did not cost the live write.
+        let live = store
+            .clone()
+            .find(partition, repushed)
+            .await
+            .expect("the re-pushed fragment is in the index");
+        assert_eq!(live.matching, StoreMatch::MatchFull);
+        assert_eq!(live.data.size_content, payload.len() as u64);
+        assert_ne!(live.data.pack_file, 0, "the re-pushed fragment kept no payload");
     }
 
     /// An obliterated fragment is meant to hold no payload, so verifying one reports nothing
