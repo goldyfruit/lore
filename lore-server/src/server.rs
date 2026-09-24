@@ -1843,6 +1843,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
+    // Far enough after startup that the server is serving and a restart storm does not turn
+    // into a collection storm, short enough that a server restarting a few times a day still
+    // collects. Clamped to `interval` below so a deliberately short interval is not lengthened.
+    const GC_FIRST_PASS_DELAY_SECONDS: u64 = 300;
+
     // Reachability-based collection. Off unless configured, and a dry run unless the
     // operator explicitly turns that off, because an incomplete mark deletes live data.
     if let Some(gc_settings) = settings.server.gc.clone()
@@ -1855,9 +1860,32 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             "Reachability GC enabled: every {}s, dry_run={}, grace={}s",
             gc_settings.interval_seconds, gc_settings.dry_run, gc_settings.grace_seconds
         );
+        // A fixed-rate ticker, not `sleep(interval)` in a loop, and a SHORT first tick.
+        //
+        // `sleep(interval)` at the top of the loop makes the real period `interval + pass
+        // duration`, so every pass lands later than the last and the schedule walks around the
+        // clock — which is exactly why a pass could not be caught by watching at the hour it was
+        // nominally due. Worse, it means the first pass is a full interval after startup, so a
+        // server that restarts more often than `interval_seconds` collects nothing, ever, while
+        // reporting itself enabled and correctly configured. This server crash-looped 16 times at
+        // ~75s per run on 2026-09-22; not one pass could have executed in that window.
+        //
+        // `MissedTickBehavior::Delay` keeps a slow pass from being followed by a burst of
+        // catch-up ticks: if a pass overruns, the next tick is simply rescheduled a full interval
+        // after it finishes, which is the behaviour an operator expects from "every N seconds".
+        let first_delay = Duration::from_secs(GC_FIRST_PASS_DELAY_SECONDS).min(interval);
         drop(lore_base::lore_spawn!(async move {
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + first_delay,
+                interval,
+            );
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tokio::time::sleep(interval).await;
+                ticker.tick().await;
+                // Logged before the walk, not only after it: a pass over millions of fragments
+                // takes minutes, and without this there is no way to tell a collector that is
+                // working from one that never started.
+                info!("Reachability GC pass starting");
                 match crate::gc::run(
                     gc_immutable.clone(),
                     gc_mutable.clone(),
