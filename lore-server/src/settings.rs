@@ -461,10 +461,50 @@ pub struct QuicSettings {
     pub permit_timeout_ms: Option<u64>,
 }
 
+/// Reachability-based garbage collection.
+///
+/// Unlike `immutable_store.local.max_capacity`, which evicts by last access and will
+/// drop fragments a live repository still needs, this walks the repositories the
+/// server holds and only collects what none of them reference.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcSettings {
+    /// Whether to run periodic passes at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Report what would be collected without deleting anything. Defaults to true:
+    /// an incomplete mark deletes live data, so deletion is opt-in.
+    #[serde(default = "default_gc_dry_run")]
+    pub dry_run: bool,
+    /// Seconds between passes.
+    #[serde(default = "default_gc_interval")]
+    pub interval_seconds: u64,
+    /// Protect fragments touched within this many seconds. The mark and the sweep
+    /// are not atomic, so a push running alongside a pass can write or reference
+    /// fragments the mark never saw; leaving recently-touched fragments for a later
+    /// pass closes that race without blocking writers.
+    #[serde(default = "default_gc_grace")]
+    pub grace_seconds: u64,
+}
+
+fn default_gc_grace() -> u64 {
+    3600
+}
+
+fn default_gc_dry_run() -> bool {
+    true
+}
+
+fn default_gc_interval() -> u64 {
+    3600
+}
+
 #[derive(Clone, Debug, Deserialize)]
-//#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
+    /// Reachability-based collection of the immutable store. Absent leaves it off.
+    pub gc: Option<GcSettings>,
     pub grpc: Option<GrpcSettings>,
     /// One block per public gRPC service; an absent table enables every
     /// service.

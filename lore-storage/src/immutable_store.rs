@@ -334,6 +334,15 @@ pub async fn query_one(
     Ok(result[0])
 }
 
+/// What one sweep looked at.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SweepReport {
+    pub scanned: usize,
+    pub collected: usize,
+    /// Unreferenced but inside the grace window, so left alone this pass.
+    pub protected: usize,
+}
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
@@ -524,6 +533,34 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError>;
+
+    /// Sweep the store against a set of reachable addresses, obliterating every
+    /// fragment that is not in it.
+    ///
+    /// This is the reference-aware counterpart to [`Self::evict`]: eviction ranks by
+    /// last access and capacity and will happily drop fragments a repository still
+    /// needs, which makes it unusable where the store is the source of truth rather
+    /// than a cache. The caller is responsible for `live` being complete — a missing
+    /// address here means data loss — so implementations must honour `dry_run`,
+    /// which counts what would be collected and changes nothing.
+    ///
+    /// `grace_seconds` protects fragments touched within that window. Marking and
+    /// sweeping are not atomic: a push running alongside the walk writes fragments the
+    /// mark never saw, and can reference existing ones the mark judged unreachable.
+    /// Both paths stamp an entry's last access, so declining to collect anything
+    /// stamped recently closes that race without locking writers out.
+    ///
+    /// The default reports nothing swept, for stores that cannot enumerate their
+    /// contents (remote, replica and composite stores).
+    async fn sweep_unreferenced(
+        self: Arc<Self>,
+        _live: &std::collections::HashSet<Address>,
+        _dry_run: bool,
+        _grace_seconds: u64,
+        _stats: Arc<StoreObliterateStats>,
+    ) -> Result<SweepReport, StoreError> {
+        Ok(SweepReport::default())
+    }
 
     /// Evict fragments from the store until the given max capacity is reached.
     /// When `sync_data` is true, data is synced to the storage media (fsync).

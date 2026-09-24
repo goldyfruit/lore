@@ -3914,6 +3914,87 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         .into()
     }
 
+    async fn sweep_unreferenced(
+        self: Arc<Self>,
+        live: &std::collections::HashSet<Address>,
+        dry_run: bool,
+        grace_seconds: u64,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<crate::immutable_store::SweepReport, StoreError> {
+        // Collect first, obliterate after: `obliterate` takes bucket locks itself, so
+        // deleting while holding a read guard would deadlock.
+        let mut scanned = 0usize;
+        let mut protected = 0usize;
+        let mut collectable: Vec<(Partition, Address)> = Vec::new();
+        let now = Self::last_access();
+
+        for group in self.group.iter() {
+            if self.gc_stop_requested() {
+                break;
+            }
+            let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            for bucket_index in 0..active_buckets {
+                let Some(bucket_ref) = group.try_bucket(bucket_index) else {
+                    continue;
+                };
+                let bucket = bucket_ref.read().await;
+                for entry in bucket.entry.iter() {
+                    scanned += 1;
+                    if live.contains(&entry.address) {
+                        continue;
+                    }
+                    // The mark ran before this sweep, so a fragment written or read
+                    // since then may be reachable in ways the mark could not see.
+                    // Both stamp last access, so anything stamped inside the window
+                    // waits for a later pass rather than being collected on a guess.
+                    let last_access = Self::load_last_access(&entry.data);
+                    if now.saturating_sub(last_access) < grace_seconds {
+                        protected += 1;
+                        continue;
+                    }
+                    collectable.push((entry.partition, entry.address));
+                }
+            }
+        }
+
+        let collected = collectable.len();
+        let report = crate::immutable_store::SweepReport {
+            scanned,
+            collected,
+            protected,
+        };
+        if dry_run {
+            lore_base::lore_debug!(
+                "Reachability sweep (dry run): {scanned} scanned, {collected} collectable, {protected} protected by grace"
+            );
+            // Naming them is what makes an incomplete mark diagnosable rather than
+            // just a number; a complete mark on an all-live store prints nothing.
+            for (partition, address) in collectable.iter().take(16) {
+                lore_base::lore_debug!(
+                    "Reachability sweep would collect {address} in partition {partition}"
+                );
+            }
+            return Ok(report);
+        }
+
+        for (partition, address) in collectable {
+            if self.gc_stop_requested() {
+                break;
+            }
+            if let Err(err) = self
+                .clone()
+                .obliterate(partition, address, stats.clone())
+                .await
+            {
+                lore_base::lore_warn!("Reachability sweep failed to obliterate: {err}");
+            }
+        }
+        lore_base::lore_debug!(
+            "Reachability sweep: {scanned} scanned, {collected} obliterated, {protected} protected by grace"
+        );
+        Ok(report)
+    }
+
     async fn evict(
         self: Arc<Self>,
         max_capacity: usize,
