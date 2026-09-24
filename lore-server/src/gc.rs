@@ -108,13 +108,13 @@ pub async fn collect_live_addresses(
             }
         }
 
-        let mut branches = match branch::list(repo.clone()).await {
-            Ok(branches) => branches,
-            Err(err) => {
-                lore_base::lore_warn!("GC: failed to list branches for {id}: {err}");
-                continue;
-            }
-        };
+        // Aborting, not `continue`. A repository whose branches could not be listed has NOTHING
+        // marked live, so carrying on would offer its entire contents up for collection. The same
+        // rule the error paths above follow: a walk that cannot prove reachability collects
+        // nothing.
+        let mut branches = branch::list(repo.clone())
+            .await
+            .map_err(|err| format!("failed to list branches for {id}: {err}"))?;
 
         while let Some(branch_id) = branches.next().await {
             report.branches += 1;
@@ -132,15 +132,31 @@ pub async fn collect_live_addresses(
                 }
             }
 
-            let revisions =
-                match branch::list_revisions(repo.clone(), Some(branch_id), None, None, None).await
-                {
-                    Ok(revisions) => revisions,
-                    Err(err) => {
-                        lore_base::lore_warn!("GC: failed to list revisions for {branch_id}: {err}");
-                        continue;
-                    }
-                };
+            // `limit` MUST be passed explicitly: `list_revisions` defaults it to 100, so the
+            // natural-looking `None` walks only a branch's newest hundred revisions and leaves
+            // everything older unmarked — which is to say, collectable. Measured on this server
+            // 2026-09-24: PowerCity was at revision 170, the mark saw 100 of them, and a dry run
+            // offered 1,107,553 of 3,183,607 fragments (34.8% of the store) for deletion. The
+            // previous known-good pass collected 531 of 963,264 (0.055%).
+            let revisions = branch::list_revisions(
+                repo.clone(),
+                Some(branch_id),
+                Some(usize::MAX),
+                None,
+                None,
+            )
+            .await
+            .map_err(|err| format!("failed to list revisions for {branch_id}: {err}"))?;
+
+            // Belt and braces, and the part that makes this class of bug impossible rather than
+            // merely fixed: if the walk still reports more to come, the mark is incomplete and
+            // whatever it did not see would be collected. Refuse the pass instead.
+            if revisions.has_more {
+                return Err(format!(
+                    "revision walk for branch {branch_id} was truncated; refusing to collect \
+                     against an incomplete mark"
+                ));
+            }
 
             for item in revisions.revisions.iter() {
                 report.revisions += 1;
