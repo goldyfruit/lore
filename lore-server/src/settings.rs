@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
 use crate::authnz::repository_authorizer::select_repository_authorizer;
+use crate::authnz::repository_catalog::select_repository_catalog;
 use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
@@ -184,9 +185,11 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
-    // Run the authorizer selection at load, so a refused pairing bails here,
-    // before any initialization, instead of at server startup.
+    // Run the authorizer and catalog selection at load, so a refused pairing
+    // bails here, before any initialization, instead of at server startup.
     select_repository_authorizer(auth, auth_url)
+        .map_err(|err| config::ConfigError::Message(err.to_string()))?;
+    select_repository_catalog(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
@@ -289,9 +292,15 @@ pub struct AuthSettings {
     pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
-    /// access to the contents.
+    /// access to the contents. Consulted by the `baseline` catalog only.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
+    /// Which catalog answers the repository listing. Absent: `auth_service`
+    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    pub repository_catalog: Option<RepositoryCatalogMode>,
+    /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
+    /// `[environment.endpoint] auth_url`.
+    pub repository_catalog_url: Option<String>,
 }
 
 impl AuthSettings {
@@ -326,6 +335,17 @@ pub enum BaselineAccess {
     Denied,
 }
 
+/// Which catalog answers the repository listing.
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCatalogMode {
+    /// Answer per `baseline_access` from the server's own store.
+    Baseline,
+    /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
+    /// caller's token.
+    AuthService,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct GrpcSettings {
@@ -340,6 +360,12 @@ pub struct GrpcSettings {
     /// Keep below the ALB timeout to ensure we gracefully observe stuck requests
     /// rather than clients receive a 504 response from the ALB
     pub request_handler_timeout_seconds: u64,
+    /// Ceiling on the partition-access authorization check that precedes a
+    /// handler, covering the online authorizer call it may make. Sized for
+    /// reaching the authorizer rather than for a whole request, so it is well
+    /// below `request_handler_timeout_seconds`.
+    #[serde(default = "default_authorization_timeout_seconds")]
+    pub authorization_timeout_seconds: u64,
     /// Require client certificates (mTLS): `true` demands a full mTLS triple,
     /// `false` accepts unverified clients.
     #[serde(default = "default_verify_client_certs")]
@@ -348,6 +374,10 @@ pub struct GrpcSettings {
 
 fn default_verify_client_certs() -> bool {
     true
+}
+
+pub(crate) fn default_authorization_timeout_seconds() -> u64 {
+    10
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -457,6 +487,28 @@ pub struct ServerSettings {
     pub runtime_shutdown_timeout_seconds: u16,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
+    /// Disk space monitoring for the local store paths.
+    #[serde(default)]
+    pub local_store_monitor: LocalStoreMonitorSettings,
+}
+
+/// Periodic monitoring of the disk space available to the local store.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct LocalStoreMonitorSettings {
+    /// Seconds between checks. Zero turns monitoring off.
+    pub check_interval_seconds: u64,
+    /// Available space, in bytes, below which a warning is logged.
+    pub low_space_threshold_bytes: u64,
+}
+
+impl Default for LocalStoreMonitorSettings {
+    fn default() -> Self {
+        Self {
+            check_interval_seconds: 30,
+            low_space_threshold_bytes: 10 * 1024 * 1024 * 1024,
+        }
+    }
 }
 
 // For when this server acts as a client to another server's Internal port
@@ -693,6 +745,43 @@ mod tests {
             .expect("[server.http] should deserialize")
     }
 
+    const TEN_GIB: u64 = 10 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn local_store_monitor_checks_every_thirty_seconds_below_ten_gibibytes() {
+        let settings = LocalStoreMonitorSettings::default();
+
+        assert_eq!(settings.check_interval_seconds, 30);
+        assert_eq!(settings.low_space_threshold_bytes, TEN_GIB);
+    }
+
+    /// Existing config files carry no `[server.local_store_monitor]` table, so
+    /// an absent table has to leave the server running on the defaults.
+    #[test]
+    fn server_settings_default_the_local_store_monitor_table() {
+        let server: ServerSettings =
+            toml::from_str("").expect("[server] with no tables should deserialize");
+
+        assert_eq!(server.local_store_monitor.check_interval_seconds, 30);
+        assert_eq!(
+            server.local_store_monitor.low_space_threshold_bytes,
+            TEN_GIB
+        );
+    }
+
+    #[test]
+    fn local_store_monitor_keys_are_optional_one_by_one() {
+        let settings: LocalStoreMonitorSettings = toml::from_str(
+            r#"
+            check_interval_seconds = 5
+        "#,
+        )
+        .expect("[server.local_store_monitor] should deserialize");
+
+        assert_eq!(settings.check_interval_seconds, 5);
+        assert_eq!(settings.low_space_threshold_bytes, TEN_GIB);
+    }
+
     /// A bare-string `jwt_issuer` and a one-entry list are the same
     /// configuration, so existing config files need no edit.
     #[test]
@@ -750,6 +839,8 @@ mod tests {
             resource_wildcard = "urc-*"
             identity_claim = "preferred_username"
             baseline_access = "reachable"
+            repository_catalog = "auth_service"
+            repository_catalog_url = "https://catalog.example.com"
         "#,
         )
         .expect("[server.auth] with every authorization field should deserialize");
@@ -761,6 +852,14 @@ mod tests {
         assert_eq!(auth.resource_wildcard, "urc-*");
         assert_eq!(auth.identity_claim, "preferred_username");
         assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
+        assert_eq!(
+            auth.repository_catalog,
+            Some(RepositoryCatalogMode::AuthService)
+        );
+        assert_eq!(
+            auth.repository_catalog_url.as_deref(),
+            Some("https://catalog.example.com")
+        );
     }
 
     /// A config setting none of the authorization fields gets the documented
@@ -783,6 +882,8 @@ mod tests {
         assert_eq!(auth.permission_claim, None);
         assert_eq!(auth.resource_claim, None);
         assert_eq!(auth.identity_claim, "sub");
+        assert_eq!(auth.repository_catalog, None);
+        assert_eq!(auth.repository_catalog_url, None);
     }
 
     /// Minimal loadable settings with the given `[server.auth]` keys, for the
@@ -936,6 +1037,27 @@ mod tests {
             .expect_err("auth_url with resource_claim must fail validation");
         assert!(error.to_string().contains("auth_url"), "{error}");
         assert!(error.to_string().contains("resource_claim"), "{error}");
+    }
+
+    /// `repository_catalog = "auth_service"` with no endpoint to ask is
+    /// refused at load, naming both settings that could supply one.
+    #[test]
+    fn auth_service_catalog_without_an_endpoint_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://issuer.example.com"
+            jwt_audience = ["lore-service"]
+            repository_catalog = "auth_service"
+        "#,
+        )
+        .expect("the incomplete pairing still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_service without an endpoint must fail validation");
+        assert!(
+            error.to_string().contains("repository_catalog_url"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("auth_url"), "{error}");
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

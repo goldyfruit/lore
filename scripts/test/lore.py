@@ -53,6 +53,27 @@ from service_util import name_service_executable
 logger = logging.getLogger(__name__)
 
 
+def lore_test_env(global_dir: str) -> dict[str, str]:
+    """Builds the environment a Lore command needs to stay inside this test.
+
+    Sets the paths that isolate config and credentials per test. Use this when
+    spawning Lore as a subprocess outside of the `Lore` wrapper, such as when a
+    test needs to kill a process mid-operation or read streaming output.
+
+    For service mode, use `Lore.sandboxed_env()` which also names the service
+    executable when `LORE_USE_SERVICE` is set.
+    """
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir
+    # Isolate the auth token store per test so a developer's locally cached
+    # credentials don't leak into smoke runs. Assigned rather than defaulted:
+    # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` a
+    # developer or CI already exports would win and the command would read
+    # that store.
+    env["LORE_AUTH_PATH"] = global_dir
+    return env
+
+
 # TODO: Remove the following section when pytest migrations are done
 def lore_ensure_local():
     remote_url = os.getenv("LORE_REMOTE_URL")
@@ -160,7 +181,7 @@ class Lore:
         lore_executable_path: str,
         path: str,
         name: str,
-        global_dir: str,
+        base_env: dict[str, str],
         environment_vars: dict[str, str] | None = None,
         remote_url: str | None = None,
         remote_path: str | None = None,
@@ -171,7 +192,10 @@ class Lore:
         self.lore_executable_path = lore_executable_path
         self.path = path
         self.name = name
-        self.global_dir = global_dir
+        # The base environment for subprocess isolation, from the
+        # `lore_subprocess_env` fixture. `sandboxed_env()` layers repo-specific
+        # settings on top of this.
+        self.base_env = base_env
         self.environment_vars = environment_vars or {}
         # The `new_lore_repo` fixture's record of what to remove when the test
         # ends. Handed down to every repository this one clones, so a clone --
@@ -238,22 +262,14 @@ class Lore:
         credentials rather than the ones this test set up. `extra` wins over
         what this repository sets.
         """
-        env = os.environ.copy()
-        for k, v in self.environment_vars.items():
-            env[k] = v
-        env["LORE_GLOBAL_PATH"] = self.global_dir
-        # Isolate the auth token store per test so a developer's locally cached
-        # credentials don't leak into smoke runs. Assigned rather than defaulted:
-        # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` a
-        # developer or CI already exports would win and the command would read
-        # that store. A test that names its own keeps it -- `test_auth_online`
-        # gives each actor a store through `environment_vars`.
-        if "LORE_AUTH_PATH" not in self.environment_vars:
-            env["LORE_AUTH_PATH"] = self.global_dir
-        # Ahead of naming the executable, which reads `LORE_USE_SERVICE`: a
-        # caller turning relaying on through `extra` has to be the value that
-        # decision sees, or the command relays with no executable named and
-        # quietly runs locally instead.
+        # Start with the base test environment, then layer repository-specific
+        # settings on top. A test that names its own auth path through
+        # `environment_vars` keeps it -- `test_auth_online` gives each actor
+        # a store that way.
+        env = self.base_env.copy()
+        env.update(self.environment_vars)
+        # `extra` wins, and must be applied before naming the executable so that
+        # a caller turning relaying on through `extra` has it seen by that check.
         env.update(extra)
         return name_service_executable(env, self.lore_executable_path)
 
@@ -1708,36 +1724,26 @@ class Lore:
             **kwargs,
         )
 
-    def auth_user_info_capi(
-        self, library_path: str, user_ids: str | list[str] | None = None
-    ) -> int:
-        """Resolve user IDs through the public C API, returning the FFI code.
+    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+        """Runs `lore_ffi.py` as a subprocess, returning the FFI code the call it
+        drives answered: 0 on success, the failing error's code otherwise.
 
-        `authUserInfo` has no CLI surface — the commands that resolve display
-        names discard failures — so this drives `liblore` directly, the same
-        entry point the SDK binds. The call runs in a subprocess so it reads
-        this repository's isolated auth and global directories, and so a crash
-        in the library fails this test rather than the whole pytest worker.
+        Out of process so the call reads this repository's isolated auth and
+        global directories, and so a crash in the library fails one test rather
+        than the pytest worker sharing it. Run from the repository, as `run()`
+        does: repository discovery falls back to the working directory, and the
+        checkout pytest runs from is itself a repository — inheriting that cwd
+        would let a bad repository path silently resolve somewhere else.
         """
-        if user_ids is None:
-            user_ids = []
-        elif isinstance(user_ids, str):
-            user_ids = [user_ids]
-
         command_args = [
             sys.executable,
             str(Path(__file__).with_name("lore_ffi.py")),
-            "auth-user-info",
+            command,
             library_path,
-            self.path,
-            *user_ids,
+            *args,
         ]
         command_string = " ".join(command_args)
         logger.info("Executing Lore C API driver: %s", command_string)
-        # Run from the repository, as `run()` does: repository discovery falls
-        # back to the working directory, and the checkout pytest runs from is
-        # itself a repository — inheriting that cwd would let a bad repository
-        # path silently resolve somewhere else.
         result = subprocess.run(
             command_args,
             capture_output=True,
@@ -1753,38 +1759,42 @@ class Lore:
         )
         return result.returncode
 
+    def auth_user_info_capi(
+        self, library_path: str, user_ids: str | list[str] | None = None
+    ) -> int:
+        """Resolve user IDs through the public C API, returning the FFI code.
+
+        `authUserInfo` has no CLI surface — the commands that resolve display
+        names discard failures — so this drives `liblore` directly, the same
+        entry point the SDK binds.
+        """
+        if user_ids is None:
+            user_ids = []
+        elif isinstance(user_ids, str):
+            user_ids = [user_ids]
+
+        return self._capi_driver(library_path, "auth-user-info", self.path, *user_ids)
+
     def service_capi(self, library_path: str, command: str) -> int:
         """Start or stop the service through the public C API, returning the FFI
         code. `command` is `service-start` or `service-stop`.
 
         The CLI's `service start`/`stop` wrap these, so a test driving the CLI
         covers the wrapper rather than the entry point an SDK consumer calls.
-        Run in a subprocess for the reasons `auth_user_info_capi` is: this
-        repository's isolated directories, and a crash failing one test rather
-        than the pytest worker. It matters twice over here — the library records
-        a service running in its own process, which no later test could undo.
+        Running out of process matters twice over here: the library records a
+        service running in its own process, which no later test could undo.
         """
-        command_args = [
-            sys.executable,
-            str(Path(__file__).with_name("lore_ffi.py")),
-            command,
-            library_path,
-        ]
-        logger.info("Executing Lore C API driver: %s", " ".join(command_args))
-        result = subprocess.run(
-            command_args,
-            capture_output=True,
-            text=True,
-            env=self._subprocess_env(),
-            cwd=self.path if os.path.isdir(self.path) else None,
-        )
-        logger.info(
-            "Lore C API driver (%s) exited %s, output:\n%s",
-            command,
-            result.returncode,
-            result.stdout + result.stderr,
-        )
-        return result.returncode
+        return self._capi_driver(library_path, command)
+
+    def revision_sync_capi(self, library_path: str, view: str = "") -> int:
+        """Sync through the public C API, returning the FFI code.
+
+        The CLI fills `lore_revision_sync_args_t` from its own flags, so driving
+        it covers the mapping rather than the struct. A consumer that lays the
+        struct out itself is the one the field order and widths have to be right
+        for, and the library reads them out of memory that consumer allocated.
+        """
+        return self._capi_driver(library_path, "revision-sync", self.path, view)
 
     def layer_add(
         self,
@@ -2003,7 +2013,7 @@ class Lore:
             **kwargs,
         )
         new_repo = Lore(
-            global_dir=self.global_dir,
+            base_env=self.base_env,
             remote_path=self.remote_path,
             remote_url=self.remote,
             lore_executable_path=self.lore_executable_path,
@@ -2228,6 +2238,7 @@ class Lore:
         dependency_tags: list[str] | None = None,
         dependency_recursive: bool = False,
         dependency_depth_limit: int = 0,
+        view: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         root_file_args = []
@@ -2239,6 +2250,7 @@ class Lore:
         return self.run(
             ["sync"]
             + ([revision] if revision else [])
+            + (["--view", self._fix_path(view)] if view else [])
             + (["--forward-changes"] if forward_changes else [])
             + (["--reset"] if reset else [])
             + root_file_args

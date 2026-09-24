@@ -6,6 +6,7 @@ use lore_error_set::prelude::*;
 
 use crate::bitflagsops;
 use crate::fs::filesystem_provider::FileInfo;
+use crate::interface::LoreNodeType;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
@@ -85,6 +86,10 @@ bitflags! {
         const Staged = 0b10000000;
         // Change is dirty (filesystem modification detected)
         const Dirty = 0b100000000;
+        // The working file carries an executable bit no revision gave it, which realizing the
+        // change keeps: the content is written and the bit left as a local modification. Set by
+        // the verify, so a reset or a forced sync carries the bit the node names instead.
+        const LocalMode = 0b1000000000;
     }
 }
 bitflagsops!(Flags, u16);
@@ -96,6 +101,10 @@ impl Flags {
 
     pub fn is_dirty(&self) -> bool {
         self.contains(Flags::Dirty)
+    }
+
+    pub fn is_local_mode(&self) -> bool {
+        self.contains(Flags::LocalMode)
     }
 
     pub fn is_merge(&self) -> bool {
@@ -396,6 +405,17 @@ pub async fn is_conflict(
     }
     // Both are files and hashes match
     Ok(false)
+}
+
+/// The subtree moves between repositories along with a mount replaced between a directory and a
+/// link, so a change the other side of a merge made below it does not stand on its own.
+pub fn is_link_replacement(change: &NodeChange) -> bool {
+    if !change.from.mapping.node.is_valid_node_id() || !change.to.mapping.node.is_valid_node_id() {
+        return false;
+    }
+    let from_type = change.from.flags.node_type();
+    let to_type = change.to.flags.node_type();
+    from_type != to_type && (from_type == LoreNodeType::Link || to_type == LoreNodeType::Link)
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {

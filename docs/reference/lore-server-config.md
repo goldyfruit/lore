@@ -82,12 +82,40 @@ With no config files loaded, the server runs as a self-contained, single-node in
 
 ## Server and endpoint settings
 
-The `[server]` table and its sub-tables configure the network endpoints and graceful-shutdown behavior.
+The `[server]` table and its sub-tables configure the network endpoints, graceful-shutdown behavior, and the disk space check on the local stores.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+
+### Advertised endpoints
+
+`[environment.endpoint]` defines the external service endpoints advertised for the client.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
+| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+
+```toml
+[environment.endpoint]
+auth_url = "ucs-auth://auth.example.com"
+user_url = "ucs-auth://directory.example.com"
+```
+
+### Local store disk space
+
+`[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `check_interval_seconds` | `30` | Seconds between checks. `0` turns the check off. |
+| `low_space_threshold_bytes` | `10737418240` | Warn while free space on a volume holding a local store is below this (10 GiB). |
+
+The reading is taken per volume, not per store: stores sharing a filesystem are checked once and named together in a single warning. The first check runs at startup, so a server starting on a full volume says so immediately. A store path that matches no mounted filesystem is warned about once and goes unmonitored until a mount covers it again.
+
+At startup the server also reports where each local store lands, warning when the configuration names no path, when the path is inside a system temporary directory (see [Zero-config defaults](#zero-config-defaults)), and when a composite tier names a path nothing is written at.
 
 ### QUIC endpoints
 
@@ -353,7 +381,9 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
 | `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
 | `identity_claim` | `sub` | The claim recorded and compared as the caller's identity. The value read from this claim will be recorded as the user ID in Lore revisions. Any unique string value can be used as the user ID. |
-| `baseline_access` | `denied` | What the repository listing answers for an authenticated caller with no explicit repository-specific grant: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. |
+| `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` catalog. A server with no `[server.auth]` lists everything it holds. |
+| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
+| `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
 
 `[server.auth.jwk]`:
 

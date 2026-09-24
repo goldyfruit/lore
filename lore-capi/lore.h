@@ -24,13 +24,14 @@
 //
 // Strings
 //
-// A string the library produces is a NUL-terminated buffer. A string carried
-// inside an event is valid only while the callback runs; copy its bytes to keep
-// them after the callback returns. A string the caller passes in must be valid
-// UTF-8: the library checks every string an operation carries before it starts
-// the call, and fails the whole call with error code 3 (invalid arguments)
-// naming the offending field if any of them is not. The library copies the
-// bytes, so the caller may free the string once the call returns. See
+// A non-empty string the library produces is a NUL-terminated buffer. An empty
+// one is a NULL pointer with length 0, so read length before the pointer. A
+// string carried inside an event is valid only while the callback runs; copy its
+// bytes to keep them after the callback returns. A string the caller passes in
+// must be valid UTF-8: the library checks every string an operation carries
+// before it starts the call, and fails the whole call with error code 3 (invalid
+// arguments) naming the offending field if any of them is not. The library copies
+// the bytes, so the caller may free the string once the call returns. See
 // lore_string_t for the layout of the type.
 //
 // Argument lifetime
@@ -4059,7 +4060,7 @@ typedef struct lore_global_args_t {
   uint64_t event_interval_ms;
 } lore_global_args_t;
 
-// Arguments for resolving user IDs to display names via the remote auth service.
+// Arguments for resolving user IDs to display names via the remote user service.
 typedef struct lore_auth_user_info_args_t {
   // User IDs to resolve; empty resolves the current user locally
   struct lore_string_array_t user_ids;
@@ -4961,6 +4962,9 @@ typedef struct lore_revision_sync_args_t {
   uint8_t dependency_recursive;
   // Maximum dependency traversal depth; 0 means unlimited
   uint32_t dependency_depth_limit;
+  // View filter file to leave the working files materialized under; empty to keep the view the
+  // instance holds
+  struct lore_string_t view;
 } lore_revision_sync_args_t;
 
 // Arguments for reverting the working directory to a specified revision.
@@ -5685,7 +5689,8 @@ typedef struct lore_service_stop_args_t {
 // Arguments for naming the executable the Lore service runs from.
 typedef struct lore_service_set_executable_args_t {
   // Path of the executable to start as the service. Empty clears the setting,
-  // which returns to resolving one from the running program.
+  // which prevents auto-starting the service but can still can connect to an
+  // already running service.
   struct lore_string_t executable;
 } lore_service_set_executable_args_t;
 

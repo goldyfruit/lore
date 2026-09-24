@@ -758,11 +758,7 @@ pub(crate) async fn stage_single_node(
                 existing_node.flags
             );
 
-            let existing_flags = NodeFlags::from_bits_retain(existing_node.flags);
-
-            if node_flags.bitand(NodeFlags::File | NodeFlags::Link)
-                == existing_flags.bitand(NodeFlags::File | NodeFlags::Link)
-            {
+            if node_flags.node_type() == existing_node.node_type() {
                 // Update the existing node
                 let block_dirtied = {
                     let mut block_writer = block.write();
@@ -1212,7 +1208,7 @@ async fn resolve_case_variant_collisions(
                     let from_path = relative_path.clone().push_and_freeze(&entry.name);
                     let to_path = relative_path.clone().push_and_freeze(winner_name);
                     lore_debug!("Case variant collision: unifying {from_path} into {to_path}");
-                    let _ = operation.unify_case_rename(&from_path, &to_path).await;
+                    let _ = operation.rename(&from_path, &to_path).await;
                 }
             }
         }
@@ -1912,6 +1908,39 @@ impl StagedChild {
     }
 }
 
+/// Record on `node` what a staged file carries: it is a file, it holds no children, and it is
+/// the size the walk measured.
+///
+/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
+/// see whether the revision has to carry a change to it, so a mode recorded here would be
+/// compared against itself and a change to the executable bit alone would be lost.
+fn record_staged_file(node: &mut Node, info: &FileInfo) {
+    node.flags |= NodeFlags::File;
+    node.child = 0;
+    node.size = info.size();
+}
+
+/// Whether `directory` holds both the spelling the tree carries and the one the file system
+/// showed, which a case-sensitive file system can hold side by side as separate entries.
+///
+/// The two fold together, the node having been claimed by that fold, so one listing answers for
+/// both. Read rather than taken from the parent's listing: staging a sibling renames entries in
+/// this directory, so an earlier snapshot answers a stale question. A directory that cannot be
+/// read is one that cannot be unified either, and reads as holding neither.
+async fn holds_both_spellings(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    tracked: &str,
+    observed: &str,
+) -> bool {
+    let held = operation
+        .names_folding_to(directory, observed)
+        .await
+        .unwrap_or_default();
+    held.iter().any(|spelling| spelling == tracked)
+        && held.iter().any(|spelling| spelling == observed)
+}
+
 /// Stage the child `name` of `base` from the file information the caller already holds.
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
@@ -2221,14 +2250,11 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = relative_path.join(&name);
 
-                operation
-                    .unify_case_rename(&from_path, &to_path)
-                    .await
-                    .map_err(|e| {
-                        StageError::internal(format!(
-                            "Unable to rename file system path {from_path} to {to_path}: {e}"
-                        ))
-                    })?;
+                operation.rename(&from_path, &to_path).await.map_err(|e| {
+                    StageError::internal(format!(
+                        "Unable to rename file system path {from_path} to {to_path}: {e}"
+                    ))
+                })?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -2237,33 +2263,17 @@ pub(crate) async fn stage_node_from_metadata(
                     node_name
                 );
 
-                // On case-sensitive file systems the old-cased path may still exist alongside
-                // the new one (e.g. both "Assets" and "assets" as separate directories).
-                // If so, unify the file system by merging the old into the new so that the
-                // stage picks up contents from both.
-                // Re-read rather than reused from the parent's listing: staging a sibling renames
-                // entries in this directory, so an earlier snapshot answers a stale question.
                 let old_path = relative_path.join(&node_name);
                 let new_path = relative_path.join(&name);
-                if util::fs::filesystem_names_all_exist(
-                    relative_path
-                        .to_absolute_path(repository.require_path()?)
-                        .as_path(),
-                    &[node_name.as_str(), name.as_str()],
-                )
-                .await
-                {
+                if holds_both_spellings(operation, &relative_path, &node_name, &name).await {
                     lore_debug!(
                         "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );
-                    operation
-                        .unify_case_rename(&old_path, &new_path)
-                        .await
-                        .map_err(|e| {
-                            StageError::internal(format!(
-                                "Unable to rename file system path {old_path} to {new_path}: {e}"
-                            ))
-                        })?;
+                    operation.rename(&old_path, &new_path).await.map_err(|e| {
+                        StageError::internal(format!(
+                            "Unable to rename file system path {old_path} to {new_path}: {e}"
+                        ))
+                    })?;
                 }
 
                 // Set updated node name
@@ -2326,26 +2336,24 @@ pub(crate) async fn stage_node_from_metadata(
             } else {
                 let node_path = relative_path.join(name.as_str());
 
-                file_modified_against_node(
-                    repository.clone(),
-                    &node,
-                    info.mtime(),
-                    info.size(),
-                    &node_path,
-                    !node.is_staged(),
-                    operation,
-                    &lore_storage::ContentHashes::default(),
-                )
-                .await
-                .forward::<StageError>("Failed to determine if file is modified")?
-                .is_modified()
+                info.mode_differs_from(node.mode)
+                    || file_modified_against_node(
+                        repository.clone(),
+                        &node,
+                        info.mtime(),
+                        info.size(),
+                        &node_path,
+                        !node.is_staged(),
+                        operation,
+                        &lore_storage::ContentHashes::default(),
+                    )
+                    .await
+                    .forward::<StageError>("Failed to determine if file is modified")?
+                    .is_modified()
             };
 
             if stage_file_node {
-                node.flags |= NodeFlags::File;
-                node.child = 0;
-                node.mode = info.mode(node.mode);
-                node.size = info.size();
+                record_staged_file(&mut node, &info);
                 maybe_content_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;
@@ -2551,7 +2559,7 @@ pub(crate) async fn stage_from_parent_revision(
     paths: LoreArray<LoreString>,
     merge_parent: MergeParent,
 ) -> Result<(), StageError> {
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         stage_from_parent_revision_in_operation(
             operation,
             repository.clone(),

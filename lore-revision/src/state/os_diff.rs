@@ -51,7 +51,6 @@ use crate::state::ChangeSender;
 use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_match;
 use crate::state::stream::emit;
-use crate::util;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
@@ -96,11 +95,11 @@ async fn diff_filesystem_subtree_impl(
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
 
-    match util::fs::list_path(absolute_path)
+    match crate::fs::os::list_path(absolute_path)
         .await
         .forward::<StateError>("Failed to list the path")?
     {
-        util::fs::PathListingResult::Directory { listing } => {
+        crate::fs::os::PathListingResult::Directory { listing } => {
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
@@ -118,7 +117,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_directory(ctx, listing, changes).await
         }
-        util::fs::PathListingResult::File { item } => {
+        crate::fs::os::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
             // chain exists so the add resolves its parent node.
             if ctx.intent.marks_dirty()
@@ -131,7 +130,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
-        util::fs::PathListingResult::NotFound => {
+        crate::fs::os::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
@@ -146,20 +145,14 @@ async fn diff_filesystem_subtree_impl(
     }
 }
 
-/// Compare a single file from filesystem against state and determine the type of change.
-/// This is a pure comparison function that doesn't create changes - it just determines
-/// what kind of change (if any) occurred.
+/// How the file at `file_path` compares to `from_node`: a type change, a modification, or
+/// neither. Reports what it found and leaves both trees alone.
 ///
-/// # Arguments
-/// * `repository` - Repository context
-/// * `from_node` - The state node to compare against (None if file is new)
-/// * `current_node` - The current state node (for timestamp tracking comparison)
-/// * `observed` - What the walk measured at the file
-/// * `file_path` - Path to the file (relative)
-/// * `is_filesystem_file` - Whether the filesystem path is a file (vs directory)
+/// A file is modified where its executable bit differs from the node's or its content does.
+/// The bit settles the answer on its own, so it is tested before anything is read.
 ///
-/// # Returns
-/// The comparison result indicating what type of change occurred
+/// `current_node` is what the working copy last held, which is what says whether a recorded
+/// modification time can answer for `from_node`.
 async fn compare_single_file_against_state(
     operation: &InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
@@ -192,6 +185,10 @@ async fn compare_single_file_against_state(
 
     // At this point, both are files - check for modifications
     if state_is_file && filesystem_is_file {
+        if observed.mode_differs_from(from_node.mode) {
+            return Ok(SingleFileCompareResult::Modified);
+        }
+
         // Force hash check if the from state doesn't match current state
         // (timestamp tracking only tells us if file matches what was last written,
         // which is the current state)
@@ -429,7 +426,7 @@ async fn emit_unstaged_add(
     }
     let staging = intent.stage().is_some();
     if staging {
-        record_observed_file(&state, &repository, from_node_id, observed).await?;
+        record_observed_size(&state, &repository, from_node_id, observed).await?;
     }
     if staging || !from_node.is_dirty_add() {
         mark_settled(
@@ -481,12 +478,15 @@ async fn emit_unstaged_add(
     Ok(())
 }
 
-/// Record on `node_id` what the walk measured at its path, which is what a commit reads to
-/// realize the file being staged.
+/// Record on `node_id` the size the walk measured at its path.
+///
+/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
+/// see whether the revision has to carry a change to it, so a mode recorded here would be
+/// compared against itself and a change to the executable bit alone would be lost.
 ///
 /// The node is a file already: a path whose type the tree disagrees with is replaced rather
 /// than recorded, which is [`emit_type_replacement`]'s.
-async fn record_observed_file(
+async fn record_observed_size(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     node_id: NodeID,
@@ -497,9 +497,7 @@ async fn record_observed_file(
     let block = state.block(repository.clone(), block_index).await?;
     let dirtied = {
         let mut locked_block = block.write();
-        let node = locked_block.node(node_index);
-        node.mode = observed.mode(node.mode);
-        node.size = observed.size();
+        locked_block.node(node_index).size = observed.size();
         locked_block.mark_dirty()
     };
     if dirtied {
@@ -684,7 +682,7 @@ async fn handle_single_file_compare_result(
             // compute_change_flags loads the dirty node and includes Dirty in the event.
             if ctx.intent.marks_dirty() && ctx.from_node_id.is_valid_node_id() {
                 if ctx.intent.stage().is_some() {
-                    record_observed_file(
+                    record_observed_size(
                         &ctx.state_from,
                         &ctx.repository_from,
                         ctx.from_node_id,
@@ -1186,8 +1184,8 @@ async fn diff_filesystem_directory_walk(
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     while let Some(entry) = file_listing.next().await {
-        let Some(item) =
-            util::fs::file_list_item(entry).forward::<StateError>("Unusable directory entry")?
+        let Some(item) = crate::fs::os::file_list_item(entry)
+            .forward::<StateError>("Unusable directory entry")?
         else {
             continue;
         };
@@ -2096,7 +2094,7 @@ fn diff_filesystem_subtree_merge_task(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
-    file_item: util::fs::FileListItem,
+    file_item: crate::fs::os::FileListItem,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();

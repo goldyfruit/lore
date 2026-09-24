@@ -131,7 +131,7 @@ pub(crate) async fn dirty_relative_paths(
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         dirty_relative_paths_in_operation(&operation, repository, paths).await
     })
     .await
@@ -139,8 +139,8 @@ pub(crate) async fn dirty_relative_paths(
 
 /// [`dirty_relative_paths`] against `operation`, which covers the parent's whole working tree
 /// and every layer mounted in it, so one call reads through one operation however many trees it
-/// marks.
-async fn dirty_relative_paths_in_operation(
+/// marks. For a caller that already holds one.
+pub(crate) async fn dirty_relative_paths_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
@@ -319,7 +319,7 @@ pub(crate) async fn dirty_relative_paths_in(
     state_staged: Arc<State>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         dirty_relative_paths_in_masked(
             &operation,
             repository,

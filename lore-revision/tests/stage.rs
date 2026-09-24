@@ -10,6 +10,7 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
+    use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
@@ -31,6 +32,25 @@ mod tests {
     use lore_revision::state;
 
     include!("helper.rs");
+
+    /// The names the directory holds that fold to `name`, sorted, read straight off the
+    /// filesystem: what these tests assert staging left the working tree spelling things.
+    fn names_folding_to(directory: &std::path::Path, name: &str) -> Vec<String> {
+        let folded = name.to_lowercase();
+        let mut found: Vec<String> = std::fs::read_dir(directory)
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|held| held.to_lowercase() == folded)
+            .collect();
+        found.sort();
+        found
+    }
 
     #[tokio::test]
     async fn stage_dry_run_no_persist() {
@@ -598,10 +618,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -622,10 +639,7 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.file");
@@ -749,10 +763,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
-                        .await
-                        .expect("Failed to get updated directory name");
+                let updated_name = names_folding_to(path.as_path(), "testdir");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "Testdir");
@@ -773,19 +784,12 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was updated
-                let updated_directory_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
-                        .await
-                        .expect("Failed to get updated directory name");
+                let updated_directory_name = names_folding_to(path.as_path(), "testdir");
                 assert_eq!(updated_directory_name.len(), 1);
                 let updated_directory_name = updated_directory_name[0].clone();
                 assert_eq!(updated_directory_name, "testDir");
-                let updated_file_name = lore_revision::util::fs::names_folding_to(
-                    first_directory_path.as_path(),
-                    "test.file",
-                )
-                .await
-                .expect("Failed to get updated file name");
+                let updated_file_name =
+                    names_folding_to(first_directory_path.as_path(), "test.file");
                 assert_eq!(updated_file_name.len(), 1);
                 let updated_file_name = updated_file_name[0].clone();
                 assert_eq!(updated_file_name, "teST.file");
@@ -901,10 +905,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -925,10 +926,7 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was maintained
-                let updated_name =
-                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -1099,17 +1097,20 @@ mod tests {
                         }
                     }
                 }
-                let names = lore_revision::util::fs::names_folding_to(path.as_path(), "assets")
-                    .await
-                    .expect("the directory must still be there");
-                assert_eq!(names, vec!["Assets".to_string()]);
-                assert!(
-                    lore_revision::util::fs::filesystem_names_all_exist(
-                        &path.as_path().join("Assets"),
-                        &["first.file", "second.file"]
-                    )
-                    .await,
-                    "both files must still be there, under the directory the tree names"
+                assert_eq!(
+                    vec!["Assets".to_string()],
+                    names_folding_to(path.as_path(), "assets")
+                );
+                let held = path.as_path().join("Assets");
+                assert_eq!(
+                    vec!["first.file".to_string()],
+                    names_folding_to(&held, "first.file"),
+                    "the first file must still be there, under the directory the tree names"
+                );
+                assert_eq!(
+                    vec!["second.file".to_string()],
+                    names_folding_to(&held, "second.file"),
+                    "the second file must still be there, under the directory the tree names"
                 );
 
                 // And the tree holds one directory, not one per case variation that
@@ -2093,14 +2094,32 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// The mode a node records is the one its file carries on disk, which the walk reads
-    /// through `FileInfo` rather than from the metadata directly.
+    /// The mode `signature`'s state records for `script.sh`.
+    #[cfg(target_family = "unix")]
+    async fn script_mode(repository: Arc<RepositoryContext>, signature: Hash) -> u16 {
+        let state = state::State::deserialize(repository.clone(), signature)
+            .await
+            .expect("Failed to deserialize the state");
+        let link = state
+            .find_node_link(repository.clone(), "script.sh")
+            .await
+            .expect("The state must hold the file");
+        state
+            .node(repository, link.node)
+            .await
+            .expect("The node must read back")
+            .mode
+    }
+
+    /// The mode a revision records is the one its file carried on disk, which the commit
+    /// reads from the file it fragments. Only the executable bit is tracked, and a change to
+    /// it alone is a modification the revision carries.
     ///
-    /// Only the executable bit is tracked. An already-staged node is left alone, so the
-    /// revision is committed between the two stages for the second to reach the mode.
+    /// An already-staged node is left alone, so the revision is committed between the two
+    /// stages for the second to reach the mode.
     #[cfg(target_family = "unix")]
     #[tokio::test]
-    async fn staging_a_file_records_the_executable_bit_it_carries() {
+    async fn the_executable_bit_a_file_carries_reaches_the_revision() {
         use std::os::unix::fs::PermissionsExt;
 
         let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
@@ -2126,13 +2145,15 @@ mod tests {
                 .expect("Failed to initialize repository");
 
                 let file_path = path.as_path().join("script.sh");
-                let stage_all = async |mode: u32, contents: &[u8]| {
-                    test_file_write(file_path.as_path(), contents);
+                test_file_write(file_path.as_path(), b"#!/bin/sh\necho unchanged");
+                let set_mode = |mode: u32| {
                     std::fs::set_permissions(
                         file_path.as_path(),
                         std::fs::Permissions::from_mode(mode),
                     )
                     .expect("Failed to set test file mode");
+                };
+                let stage_all = async || {
                     let signature = file::stage::stage(
                         repository.clone(),
                         &write_token,
@@ -2147,48 +2168,60 @@ mod tests {
                     )
                     .await
                     .expect("Failed to stage the test file");
-                    let staged = state::State::deserialize(repository.clone(), signature)
+                    script_mode(repository.clone(), signature).await
+                };
+                let commit_all = async || {
+                    let signature = commit::commit_boxed(
+                        repository.clone(),
+                        &write_token,
+                        CommitOptions {
+                            message: String::new(),
+                            link_messages: std::collections::HashMap::new(),
+                            link: None,
+                            layer_messages: std::collections::HashMap::new(),
+                            layer: None,
+                        },
+                    )
+                    .await
+                    .expect("Failed to commit the test file");
+                    let state = state::State::deserialize(repository.clone(), signature)
                         .await
-                        .expect("Failed to deserialize the staged state");
-                    let link = staged
+                        .expect("Failed to deserialize the committed state");
+                    let link = state
                         .find_node_link(repository.clone(), "script.sh")
                         .await
-                        .expect("The staged state must hold the file");
-                    staged
-                        .node(repository.clone(), link.node)
-                        .await
-                        .expect("The staged node must read back")
-                        .mode
+                        .expect("The committed state must hold the file");
+                    assert!(
+                        state
+                            .node_delta(repository.clone(), link.node)
+                            .await
+                            .expect("The delta must read back")
+                            .is_some(),
+                        "the revision must name the file among the nodes it changed"
+                    );
+                    script_mode(repository.clone(), signature).await
                 };
 
                 let executable = node::NodeFileMode::Executable.bits();
 
-                let mode = stage_all(0o755, b"#!/bin/sh\necho one").await;
+                set_mode(0o755);
                 assert_eq!(
                     executable,
-                    mode & executable,
-                    "an executable file must record the bit"
+                    stage_all().await & executable,
+                    "a staged add must record the bit the file carries"
+                );
+                assert_eq!(
+                    executable,
+                    commit_all().await & executable,
+                    "the revision must record the bit"
                 );
 
-                commit::commit_boxed(
-                    repository.clone(),
-                    &write_token,
-                    CommitOptions {
-                        message: String::new(),
-                        link_messages: std::collections::HashMap::new(),
-                        link: None,
-                        layer_messages: std::collections::HashMap::new(),
-                        layer: None,
-                    },
-                )
-                .await
-                .expect("Failed to commit the executable file");
-
-                let mode = stage_all(0o644, b"#!/bin/sh\necho two and three").await;
+                set_mode(0o644);
+                stage_all().await;
                 assert_eq!(
                     0,
-                    mode & executable,
-                    "a file that lost the bit must record its loss"
+                    commit_all().await & executable,
+                    "the revision must record the loss of the bit"
                 );
             }))
             .await

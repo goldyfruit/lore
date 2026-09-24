@@ -5,17 +5,13 @@ use std::future::Future;
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
@@ -29,14 +25,12 @@ use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
-use crate::hash::hash_string;
 use crate::lore_debug;
 use crate::lore_trace;
 #[cfg(not(target_family = "windows"))]
 use crate::lore_warn;
 use crate::node::NodeFileMode;
 use crate::repository::TEMP_FILE_EXTENSION;
-use crate::util::path::PathError;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
 
@@ -97,14 +91,6 @@ pub fn mode_from_observed(is_file: bool, executable: Option<bool>, previous: u16
     }
 }
 
-pub fn metadata_to_mode(metadata: &Metadata, previous: u16) -> u16 {
-    mode_from_observed(
-        metadata.is_file(),
-        file_executable_observed(metadata),
-        previous,
-    )
-}
-
 pub fn mode_changed(from: u16, to: u16) -> bool {
     // Only care about the executable bit
     (from & NodeFileMode::Executable.bits()) != (to & NodeFileMode::Executable.bits())
@@ -155,131 +141,6 @@ pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
     Some(file_is_executable(metadata))
 }
 
-/// Whether every one of `names` is present in `parent`, compared exactly rather than by the
-/// filesystem's own rules — `Path::exists` is case-insensitive on Windows and macOS, which is
-/// the distinction a caller resolving a case collision is asking about.
-///
-/// One listing answers for all of them, and it stops as soon as they are all accounted for: a
-/// caller asking about several names in a directory is asking one question about it. Asking
-/// about no names is answered without reading anything.
-///
-/// Matches are tracked in a bitmask, so at most 64 names can be asked about at once.
-pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
-    assert!(
-        names.len() <= u64::BITS as usize,
-        "filesystem_names_all_exist takes at most {} names",
-        u64::BITS
-    );
-    if names.is_empty() {
-        return true;
-    }
-
-    let Ok(mut listing) = lore_io::IoDriver::global().read_dir(parent).await else {
-        return false;
-    };
-    let wanted = if names.len() == u64::BITS as usize {
-        u64::MAX
-    } else {
-        (1u64 << names.len()) - 1
-    };
-    let mut found = 0u64;
-    while let Some(entry) = listing.next().await {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        for (index, name) in names.iter().enumerate() {
-            if entry.file_name == *name {
-                found |= 1u64 << index;
-            }
-        }
-        if found == wanted {
-            return true;
-        }
-    }
-    false
-}
-
-// TODO(mjansson): We could pass around a hashmap cache of directory to file list mappings
-// while executing an operation, to reduce the number of iterations on the file system to
-// find files and their existing names - used by filesystem_name, filesystem_path and list_files
-/// Whether the directory `path` holds a child named exactly `name`.
-///
-/// The question nearly every caller actually has, and the filesystem answers it
-/// directly: one lookup, no directory read, and no string to hold the answer.
-/// [`filesystem_names`] is for the case this rules out, where the name is on
-/// disk in some other case and the caller needs to be told which.
-///
-/// `Some(false)` does not mean the name is absent - it means not in this case.
-/// `None` is the platform declining to say, as macOS does for every name and
-/// Windows does past `MAX_PATH`; only reading the directory answers those, which
-/// is what [`names_folding_to`] is for.
-pub async fn filesystem_name_matches(path: impl AsRef<Path>, name: &str) -> Option<bool> {
-    holds_name_exactly(path.as_ref().join(name)).await
-}
-
-/// Whether the directory holding `path` holds a child named exactly as `path` spells it,
-/// which is the OS arm of [`InstanceOperation::holds_name_exactly`].
-pub async fn holds_name_exactly(path: impl AsRef<Path>) -> Option<bool> {
-    lore_io::IoDriver::global()
-        .holds_name_exactly(path.as_ref())
-        .await
-}
-
-/// Every spelling of `name` the directory `path` holds that folds to the same name, the
-/// exact one alone if it is there, and empty if no spelling is.
-///
-/// Reads the directory and compares every child, which is what answering for
-/// variations other than the one asked about takes. A caller that only needs to
-/// know whether the case it has is the one on disk should ask
-/// [`filesystem_name_matches`] instead.
-pub async fn names_folding_to(
-    path: impl AsRef<Path>,
-    name: &str,
-) -> tokio::io::Result<Vec<String>> {
-    let path = path.as_ref();
-
-    let mut matches = vec![];
-    let match_name = name.to_lowercase();
-    let mut listing = lore_io::IoDriver::global().read_dir(path).await?;
-    while let Some(entry) = listing.next().await {
-        let entry_name = entry_name(entry?.file_name).map_err(tokio::io::Error::other)?;
-        if entry_name == name {
-            // Exact match
-            return Ok(vec![entry_name]);
-        }
-        let entry_lowercase_name = entry_name.to_lowercase();
-        if entry_lowercase_name == match_name {
-            matches.push(entry_name);
-        }
-    }
-
-    if !matches.is_empty() {
-        if matches.len() == 1 {
-            lore_debug!(
-                "Found case variations for file {name} in path {}: {}",
-                path.display(),
-                matches[0]
-            );
-        } else {
-            let mut message = format!(
-                "Found case variations for file {name} in path {}:",
-                path.display()
-            );
-            for entry in matches.iter() {
-                message.push_str(format!("\n  {entry}").as_str());
-            }
-            lore_debug!("{message}");
-        }
-        return Ok(matches);
-    }
-
-    lore_debug!(
-        "Found NO case variation for file {name} in path {}",
-        path.display()
-    );
-    Ok(vec![])
-}
-
 /// The case each directory prefix is held in on disk, resolved once for the
 /// paths that share them.
 ///
@@ -290,8 +151,9 @@ pub async fn names_folding_to(
 ///
 /// Keys are relative to the base path they were resolved against, and only that
 /// one - a map built for the repository root says nothing about a path under a
-/// layer or a link mount. A prefix whose case is ambiguous or that is not
-/// there is left out, so paths under it resolve as they would have without this.
+/// layer or a link mount. A prefix [`spelling_to_take`] cannot settle, or that is
+/// not there, is left out, so paths under it resolve as they would have without
+/// this.
 #[derive(Default)]
 pub struct ResolvedPrefixes {
     prefixes: std::collections::HashMap<String, String>,
@@ -410,18 +272,15 @@ pub(crate) async fn resolve_prefixes(
                     .rfind('/')
                     .map_or(path.as_str(), |separator| &path[separator + 1..]);
                 let candidate = candidate_path(directory.as_str(), name);
-                if candidate_is_held(&operation, &candidate).await == Some(true) {
+                if operation.holds_name_exactly(&candidate).await == Some(true) {
                     let resolved = join_relative(&variation, name);
                     return Some((path, resolved));
                 }
-                // One variation is an answer; several are the ambiguity
-                // `filesystem_path` forks on, and are left for it to find as it
-                // always did. A platform that would not say arrives here too,
-                // and the read settles it.
-                if let Ok(names) = names_folding_to_in_operation(&operation, &directory, name).await
-                    && let [single] = names.as_slice()
+                // A platform that would not say arrives here too, and the read settles it.
+                if let Ok(names) = operation.names_folding_to(&directory, name).await
+                    && let Some(spelling) = spelling_to_take(&names, name)
                 {
-                    let resolved = join_relative(&variation, single);
+                    let resolved = join_relative(&variation, spelling);
                     return Some((path, resolved));
                 }
                 None
@@ -458,23 +317,30 @@ fn candidate_path(parent: &str, name: &str) -> RelativePath {
     RelativePath::new_from_clean_parts(parent, name)
 }
 
-/// [`InstanceOperation::holds_name_exactly`] for a candidate the resolver built.
-async fn candidate_is_held(
-    operation: &InstanceOperationImpl,
-    candidate: &RelativePath,
-) -> Option<bool> {
-    operation.holds_name_exactly(candidate).await
+/// The spelling to take from the ones the directory holds: the one asked for where it is among
+/// them, and the sole variation otherwise.
+///
+/// Several variations with none of them the spelling asked for is the ambiguity
+/// [`filesystem_path`] forks on, and is no answer here.
+///
+/// The spelling asked for is among them only where the platform declined the lookup that would
+/// have settled it — macOS for every name, Windows past its path limit. A platform that answers
+/// reports a name it holds as held, so a resolver reaching here has already been told the
+/// spelling is not there.
+fn spelling_to_take<'a>(held: &'a [String], name: &str) -> Option<&'a str> {
+    if let Some(exact) = held.iter().find(|spelling| *spelling == name) {
+        return Some(exact);
+    }
+    match held {
+        [single] => Some(single.as_str()),
+        _ => None,
+    }
 }
 
-/// [`InstanceOperation::names_folding_to`] for a directory the resolver built.
-async fn names_folding_to_in_operation(
-    operation: &InstanceOperationImpl,
-    directory: &RelativePath,
-    name: &str,
-) -> Result<Vec<String>, crate::fs::filesystem_provider::FsError> {
-    operation.names_folding_to(directory, name).await
-}
-
+// TODO(mjansson): We could pass around a hashmap cache of directory to file list mappings
+// while executing an operation, to reduce the number of iterations on the file system to
+// find files and their existing names - used by the resolver here and by the name lookups
+// and listings under `crate::fs::os`.
 /// `find_path` in the case the file system holds it, relative to `base` -- itself a clean path
 /// from the root the operation was opened on, and empty where the two are the same.
 ///
@@ -540,14 +406,16 @@ pub async fn filesystem_path_and_info(
         // and that costs one lookup to establish. Only where it is not, or where
         // the platform will not say, does the directory get read, and a name
         // allocated for what it says.
-        if candidate_is_held(operation, &candidate_path(found_path.as_str(), name)).await
+        if operation
+            .holds_name_exactly(&candidate_path(found_path.as_str(), name))
+            .await
             == Some(true)
         {
             found_path.push(name);
             continue;
         }
         let directory = candidate_path(found_path.as_str(), "");
-        let Ok(fs_names) = names_folding_to_in_operation(operation, &directory, name).await else {
+        let Ok(fs_names) = operation.names_folding_to(&directory, name).await else {
             return Err(tokio::io::Error::other(
                 "Failed to read the directory for case variations",
             ));
@@ -558,60 +426,60 @@ pub async fn filesystem_path_and_info(
                 "Matching file not found",
             ));
         }
-        if fs_names.len() > 1 {
-            if remain_path.is_empty() {
-                lore_debug!("Found ambiguous path case variations for {find_path}");
-                return Err(tokio::io::Error::other(
-                    "Ambiguous case variations for path {find_path}",
-                ));
-            }
-
-            // Find the match in either or many of the potential variations
-            let mut found_variation = false;
-            for entry in fs_names.iter() {
-                let next_full_path = directory.join(entry);
-
-                lore_debug!(
-                    "Fork case variation check for {remain_path} in {}",
-                    next_full_path
-                );
-                if let Ok(sub_path) =
-                    filesystem_path_fork(operation, next_full_path.as_str(), &remain_path).await
-                {
-                    if found_variation {
-                        lore_debug!("Found ambiguous path case variations for {find_path}");
-                        return Err(tokio::io::Error::other(
-                            "Ambiguous case variations found for path {find_path}",
-                        ));
-                    }
-
-                    found_path.push(entry);
-                    found_path.push(sub_path.as_str());
-
-                    lore_debug!(
-                        "Fork found case variation {sub_path} for {remain_path} in {}",
-                        next_full_path
-                    );
-                    found_variation = true;
-                } else {
-                    lore_debug!(
-                        "Fork found NO case variation for {remain_path} in {}",
-                        next_full_path
-                    );
-                }
-            }
-
-            if !found_variation {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::NotFound,
-                    "Matching file not found",
-                ));
-            }
-
-            break;
+        if let Some(spelling) = spelling_to_take(&fs_names, name) {
+            found_path.push(spelling);
+            continue;
+        }
+        if remain_path.is_empty() {
+            lore_debug!("Found ambiguous path case variations for {find_path}");
+            return Err(tokio::io::Error::other(
+                "Ambiguous case variations for path {find_path}",
+            ));
         }
 
-        found_path.push(fs_names[0].as_str());
+        // Find the match in either or many of the potential variations
+        let mut found_variation = false;
+        for entry in fs_names.iter() {
+            let next_full_path = directory.join(entry);
+
+            lore_debug!(
+                "Fork case variation check for {remain_path} in {}",
+                next_full_path
+            );
+            if let Ok(sub_path) =
+                filesystem_path_fork(operation, next_full_path.as_str(), &remain_path).await
+            {
+                if found_variation {
+                    lore_debug!("Found ambiguous path case variations for {find_path}");
+                    return Err(tokio::io::Error::other(
+                        "Ambiguous case variations found for path {find_path}",
+                    ));
+                }
+
+                found_path.push(entry);
+                found_path.push(sub_path.as_str());
+
+                lore_debug!(
+                    "Fork found case variation {sub_path} for {remain_path} in {}",
+                    next_full_path
+                );
+                found_variation = true;
+            } else {
+                lore_debug!(
+                    "Fork found NO case variation for {remain_path} in {}",
+                    next_full_path
+                );
+            }
+        }
+
+        if !found_variation {
+            return Err(tokio::io::Error::new(
+                tokio::io::ErrorKind::NotFound,
+                "Matching file not found",
+            ));
+        }
+
+        break;
     }
 
     let mut found = found_path.freeze();
@@ -641,227 +509,6 @@ pub fn filesystem_path_fork<'a>(
     // The fork resolves a path under one of several case variations of a
     // directory, which is not a prefix any map here was built against.
     Box::pin(async move { filesystem_path(operation, &base, &find_path, None).await })
-}
-
-/// Represents a single filesystem item.
-/// Used for directory children enumeration and single file metadata.
-pub struct FileListItem {
-    /// The name of the file/directory (not the full path).
-    pub name: String,
-    /// Filesystem metadata (size, timestamps, permissions, etc.).
-    pub metadata: std::fs::Metadata,
-    /// Pre-computed hash of the lowercase name for efficient lookups.
-    pub name_hash: u64,
-}
-
-/// Result of listing a filesystem path.
-/// Provides type-safe distinction between file and directory cases.
-pub enum PathListingResult {
-    /// The path was a directory.
-    ///
-    /// The listing yields an entry per child, named relative to the directory (just the
-    /// filename, not the full path). [`file_list_item`] turns one into a [`FileListItem`].
-    Directory { listing: lore_io::DirStream },
-
-    /// The path was a regular file.
-    ///
-    /// The `item.name` is the filename component of the path that was queried.
-    /// For example, querying `/foo/bar/file.txt` yields `item.name = "file.txt"`.
-    File { item: FileListItem },
-
-    /// The path did not exist, was not accessible, or was a special file type (device, socket)
-    /// that we don't handle. A link is stat'd through to what it points at, so one naming a file
-    /// or a directory answers as that rather than as a kind we hold nothing for.
-    NotFound,
-}
-
-impl PathListingResult {
-    /// Returns true if the path was a directory.
-    pub fn is_directory(&self) -> bool {
-        matches!(self, PathListingResult::Directory { .. })
-    }
-
-    /// Returns true if the path was a file.
-    pub fn is_file(&self) -> bool {
-        matches!(self, PathListingResult::File { .. })
-    }
-
-    /// Returns true if the path was not found or not accessible.
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, PathListingResult::NotFound)
-    }
-}
-
-/// Describes one listing entry.
-///
-/// `Ok(None)` is an entry the walk carries nothing for: a name it could not read, or one whose
-/// metadata would not resolve — a broken link, or a name unlinked while the walk was running —
-/// and one the repository does not track, which is a link and anything the file system holds as
-/// neither a file nor a directory. A link is answered for by what it is rather than by what it
-/// points at, so one naming a file is skipped as the link it is. A caller enumerating what is
-/// present skips all of those; one unreadable name says nothing about the rest of the directory.
-///
-/// An error is a name that is not text. Nothing can be done with such a name that is not a
-/// guess: it hashes to a node the tree does not hold, and staging it would record a name no
-/// file answers to. Only the message it is reported in spells it lossily.
-pub fn file_list_item(
-    entry: std::io::Result<lore_io::DirEntry>,
-) -> Result<Option<FileListItem>, PathError> {
-    let Ok(entry) = entry else {
-        return Ok(None);
-    };
-    if entry.is_symlink {
-        return Ok(None);
-    }
-    let Some(metadata) = entry.metadata else {
-        return Ok(None);
-    };
-    if !metadata.is_file() && !metadata.is_dir() {
-        return Ok(None);
-    }
-    let name = entry_name(entry.file_name)?;
-    let name_hash = hash_string(name.as_str());
-    Ok(Some(FileListItem {
-        name,
-        metadata,
-        name_hash,
-    }))
-}
-
-/// A directory entry's name as text, taking the bytes the listing already owns rather than a
-/// copy of them. A name that is not text is an error naming it lossily.
-pub fn entry_name(name: std::ffi::OsString) -> Result<String, PathError> {
-    name.into_string().map_err(|name| {
-        InvalidPath {
-            path: name.to_string_lossy().into_owned(),
-        }
-        .into()
-    })
-}
-
-/// Lists a filesystem path, automatically handling both file and directory cases.
-///
-/// # Arguments
-/// * `path` - The filesystem path to list
-///
-/// # Returns
-/// * `PathListingResult::Directory` - If path is a directory, with a listing of its children
-/// * `PathListingResult::File` - If path is a single file, with its metadata
-/// * `PathListingResult::NotFound` - If path doesn't exist or isn't accessible
-///
-/// # Path Semantics
-/// - For directories: Each item's `name` is the child filename (e.g., "file.txt")
-/// - For files: The item's `name` is the filename component (e.g., "file.txt" for "/foo/file.txt")
-///
-/// Listing is attempted before the path is described, since a caller walking a tree reaches this
-/// with a directory almost every time — the walk recurses into those and compares files in place.
-pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
-    let driver = lore_io::IoDriver::global();
-
-    if let Ok(listing) = driver.read_dir(path.as_path()).await {
-        return Ok(PathListingResult::Directory { listing });
-    }
-
-    let Ok(metadata) = driver.metadata(path.as_path()).await else {
-        return Ok(PathListingResult::NotFound);
-    };
-
-    if metadata.is_file() {
-        let file_name = match path.file_name() {
-            Some(name) => entry_name(name.to_os_string())?,
-            None => String::new(),
-        };
-        let name_hash = hash_string(file_name.as_str());
-
-        Ok(PathListingResult::File {
-            item: FileListItem {
-                name: file_name,
-                metadata,
-                name_hash,
-            },
-        })
-    } else {
-        // Symlink or other special file type
-        Ok(PathListingResult::NotFound)
-    }
-}
-
-/// Helper function to rename files during name case unification handling. Will try to rename
-/// the "from" file/directory to "to" name. If the "to" name already exist in the file system
-/// it will try to handle it as follows:
-/// - if the "from"/"to" is a file it will overwrite the "to" file with the "from" file, then remove
-///   the "from" file
-/// - if the "from"/"to" is a directory it will recurse and call `unify_name_case_rename` on each
-///   child item in the "from" directory to move it to the "to" directory, applying the same
-///   rules to each subitem (replacing files, recursing directories).
-pub fn unify_name_case_rename<'a>(
-    from_path: &'a Path,
-    to_path: &'a Path,
-) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let driver = lore_io::IoDriver::global();
-        lore_debug!(
-            "Try rename {} -> {}",
-            from_path.display(),
-            to_path.display()
-        );
-        if driver.rename(from_path, to_path).await.is_ok() {
-            lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-            return Ok(());
-        }
-
-        let from_metadata = driver.metadata(from_path).await?;
-        let to_metadata = driver.metadata(to_path).await?;
-
-        if from_metadata.is_dir() != to_metadata.is_dir() {
-            return Err(tokio::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Unable to rename, file/directory mismatch",
-            ));
-        }
-
-        if from_metadata.is_file() {
-            lore_debug!(
-                "Failed rename {} -> {}, replacing",
-                from_path.display(),
-                to_path.display()
-            );
-            driver.remove_file(to_path).await?;
-            if let Err(err) = driver.rename(from_path, to_path).await {
-                lore_debug!(
-                    "Failed rename {} -> {}, try copy and delete: {err}",
-                    from_path.display(),
-                    to_path.display(),
-                );
-                driver.copy(from_path, to_path).await?;
-                driver.remove_file(from_path).await?;
-            }
-        } else {
-            lore_debug!(
-                "Failed rename {} -> {}, try recursive directory unification",
-                from_path.display(),
-                to_path.display()
-            );
-            // The listing is drained before the directory goes, so nothing is still walking it.
-            let names = {
-                let mut listing = driver.read_dir(from_path).await?;
-                let mut names = Vec::new();
-                while let Some(entry) = listing.next().await {
-                    names.push(entry?.file_name);
-                }
-                names
-            };
-            for name in names {
-                let from_path = from_path.join(&name);
-                let to_path = to_path.join(&name);
-                unify_name_case_rename(&from_path, &to_path).await?;
-            }
-            driver.remove_dir_all(from_path).await?;
-        }
-
-        lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-        Ok(())
-    })
 }
 
 pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
@@ -1080,30 +727,6 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
     Ok(())
 }
 
-#[cfg(not(target_family = "windows"))]
-pub fn sync_dir<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path.as_ref())?;
-    let fd = dir.as_raw_fd();
-    // SAFETY: Safe to call libc function to flush directory changes
-    let result = unsafe { libc::fsync(fd) };
-    if result == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_family = "windows")]
-pub fn sync_dir<P: AsRef<Path>>(_path: P) -> tokio::io::Result<()> {
-    // No-op on Windows, there is no API to flush a directory
-    Ok(())
-}
-
 pub fn file_unlink_retry() -> Retry {
     RetryPolicy::builder()
         .with_initial_backoff_millis(2)
@@ -1219,152 +842,30 @@ mod tests {
         .expect("beginning an operation over the OS filesystem")
     }
 
-    #[tokio::test]
-    async fn list_path_yields_a_directory_listing() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("child"), b"data").expect("write child");
-
-        let PathListingResult::Directory { mut listing } =
-            list_path(dir.path().to_path_buf()).await.expect("listing")
-        else {
-            panic!("a directory must list");
-        };
-        let mut names = Vec::new();
-        while let Some(entry) = listing.next().await {
-            if let Some(item) = file_list_item(entry).expect("entry name") {
-                names.push(item.name);
-            }
-        }
-        assert_eq!(names, vec!["child".to_string()]);
-    }
-
-    /// A link is not a kind the repository tracks, and the listing describes what a name holds
-    /// rather than what it points at, so one naming a file is skipped as the link it is.
-    #[cfg(target_family = "unix")]
-    #[tokio::test]
-    async fn a_listing_skips_a_link_to_a_file_it_would_otherwise_track() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("target"), b"data").expect("write target");
-        std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link"))
-            .expect("link the target");
-
-        let PathListingResult::Directory { mut listing } =
-            list_path(dir.path().to_path_buf()).await.expect("listing")
-        else {
-            panic!("a directory must list");
-        };
-        let mut names = Vec::new();
-        while let Some(entry) = listing.next().await {
-            if let Some(item) = file_list_item(entry).expect("entry name") {
-                names.push(item.name);
-            }
-        }
-        assert_eq!(names, vec!["target".to_string()]);
-    }
-
-    /// A name a listing can yield that has no text spelling: bytes that are not UTF-8 on unix, an
-    /// unpaired surrogate on Windows.
-    #[cfg(target_family = "unix")]
-    fn name_that_is_not_text() -> std::ffi::OsString {
-        use std::os::unix::ffi::OsStringExt as _;
-
-        std::ffi::OsString::from_vec(vec![0xff])
-    }
-
-    #[cfg(target_family = "windows")]
-    fn name_that_is_not_text() -> std::ffi::OsString {
-        use std::os::windows::ffi::OsStringExt as _;
-
-        std::ffi::OsString::from_wide(&[0xd800])
-    }
-
-    /// A name that is not text is reported, and named lossily in the report, rather than passed
-    /// over: it hashes to a node the tree does not hold, so nothing can be done with it that is
-    /// not a guess.
-    ///
-    /// The entry is assembled rather than read off a disk so this runs wherever the crate builds.
-    /// A filesystem enforcing UTF-8 -- ZFS with `utf8only=on`, APFS -- refuses to create such a
-    /// name at all, which leaves
-    /// [`crate::fs::filesystem_provider::tests::a_name_that_is_not_text_is_reported`], the
-    /// end-to-end cover over a real listing, with nothing to list there.
     #[test]
-    fn a_listed_name_that_is_not_text_is_reported() {
-        let dir = temp_dir();
-        let path = dir.path().join("named");
-        std::fs::write(&path, b"data").expect("write file");
-        // A real file's metadata: an entry carrying none, or naming neither a file nor a
-        // directory, is passed over before its name is read.
-        let metadata = std::fs::metadata(&path).expect("read metadata");
-
-        let listed = file_list_item(Ok(lore_io::DirEntry {
-            file_name: name_that_is_not_text(),
-            metadata: Some(metadata),
-            is_symlink: false,
-        }));
-
-        let Err(error) = listed else {
-            panic!("a name with no text spelling must be reported, not listed");
-        };
-        assert!(
-            error.to_string().contains('\u{fffd}'),
-            "the report names the entry lossily, not by a spelling it does not have: {error}"
-        );
+    fn a_sole_variation_is_the_spelling_to_take() {
+        let held = vec!["Assets".to_string()];
+        assert_eq!(Some("Assets"), spelling_to_take(&held, "assets"));
     }
 
-    #[tokio::test]
-    async fn list_path_describes_a_file_by_its_own_name() {
-        let dir = temp_dir();
-        let path = dir.path().join("lonely.txt");
-        std::fs::write(&path, b"data").expect("write file");
-
-        let PathListingResult::File { item } = list_path(path).await.expect("listing") else {
-            panic!("a file must be described, not listed");
-        };
-        assert_eq!(item.name, "lonely.txt");
-        assert_eq!(item.metadata.len(), 4);
+    /// The spelling asked for wins over its neighbours, which is what keeps a collision between
+    /// two variations from reading as an ambiguity for a caller that named one of them.
+    #[test]
+    fn the_spelling_asked_for_wins_over_a_coexisting_variation() {
+        let held = vec!["Assets".to_string(), "assets".to_string()];
+        assert_eq!(Some("assets"), spelling_to_take(&held, "assets"));
     }
 
-    #[tokio::test]
-    async fn list_path_reports_a_missing_path() {
-        let dir = temp_dir();
-        assert!(
-            list_path(dir.path().join("absent"))
-                .await
-                .expect("listing")
-                .is_not_found(),
-            "a missing path is neither a file nor a directory"
-        );
+    /// Several variations, none of them the one asked for, is the ambiguity the caller forks on.
+    #[test]
+    fn coexisting_variations_the_caller_did_not_name_are_no_answer() {
+        let held = vec!["Assets".to_string(), "ASSETS".to_string()];
+        assert_eq!(None, spelling_to_take(&held, "assets"));
     }
 
-    /// Asking about no names is satisfied by any directory, including an empty one — the check
-    /// is over the names given, and there are none to be missing.
-    #[tokio::test]
-    async fn all_names_exist_is_true_for_no_names() {
-        let dir = temp_dir();
-        assert!(filesystem_names_all_exist(dir.path(), &[]).await);
-    }
-
-    #[tokio::test]
-    async fn all_names_exist_requires_every_name() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("one"), b"").expect("write one");
-        std::fs::write(dir.path().join("two"), b"").expect("write two");
-
-        assert!(filesystem_names_all_exist(dir.path(), &["one", "two"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["one", "three"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["three"]).await);
-    }
-
-    /// The comparison is exact, which is the whole reason this exists rather than `Path::exists`:
-    /// on a case-insensitive filesystem that would answer for a name that is not the one asked
-    /// about.
-    #[tokio::test]
-    async fn all_names_exist_compares_exactly() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Assets"), b"").expect("write Assets");
-
-        assert!(filesystem_names_all_exist(dir.path(), &["Assets"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["assets"]).await);
+    #[test]
+    fn a_directory_holding_no_spelling_is_no_answer() {
+        assert_eq!(None, spelling_to_take(&[], "assets"));
     }
 
     fn depth_paths(paths: &[&str]) -> Vec<DepthPath> {
@@ -1387,58 +888,27 @@ mod tests {
         insensitive
     }
 
-    /// What the lookup answers where the platform has one, and `None` where it
-    /// has not — macOS can say nothing about a case variation short of the
-    /// directory read this exists to avoid, so every expectation collapses to that
-    /// there.
-    fn verdict(held: bool) -> Option<bool> {
-        cfg!(any(target_os = "linux", target_family = "windows")).then_some(held)
-    }
-
-    /// The distinction the whole thing rests on: this answers for the case
-    /// variation asked about, where `Path::exists` answers for the file whatever
-    /// it is called. A case-insensitive filesystem finds the file under either name,
-    /// and must still say no to the one it does not hold.
+    /// A variation held beside the spelling asked for does not disturb resolving it. Where the
+    /// platform settles the lookup this never reads the directory; where it declines,
+    /// [`spelling_to_take`] answers the same. Only a case-sensitive filesystem can hold the two
+    /// directories this needs.
     #[tokio::test]
-    async fn name_matches_only_the_case_variation_on_disk() {
+    async fn path_resolves_a_leaf_whose_case_variation_coexists() {
         let dir = temp_dir();
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
-
-        assert_eq!(
-            filesystem_name_matches(dir.path(), "Test.file").await,
-            verdict(true)
-        );
-        assert_eq!(
-            filesystem_name_matches(dir.path(), "test.FILE").await,
-            verdict(false),
-            "a case variation the filesystem does not hold is not a match, whether or not it would find the file"
-        );
-        assert_eq!(
-            filesystem_name_matches(dir.path(), "other.file").await,
-            verdict(false)
-        );
-        assert_eq!(
-            filesystem_name_matches(dir.path(), "Test.file.").await,
-            verdict(false),
-            "a trailing dot names a file that is not there"
-        );
-        assert_eq!(
-            filesystem_name_matches(&dir.path().join("absent"), "Test.file").await,
-            verdict(false),
-            "a missing directory holds nothing"
-        );
-    }
-
-    /// A directory is what most components resolve to, and the lookup has to
-    /// answer for one as readily as for a file.
-    #[tokio::test]
-    async fn name_matches_a_directory() {
-        let dir = temp_dir();
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        let operation = os_operation(dir.path()).await;
         std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+        std::fs::create_dir(dir.path().join("assets")).expect("create variation");
 
+        let asked: RelativePath = std::str::FromStr::from_str("assets").expect("relative path");
         assert_eq!(
-            filesystem_name_matches(dir.path(), "Assets").await,
-            verdict(true)
+            "assets",
+            filesystem_path(&operation, "", &asked, None)
+                .await
+                .expect("the spelling asked for must settle the directory")
+                .as_str()
         );
     }
 
@@ -1503,98 +973,6 @@ mod tests {
             .await
             .expect("the path must resolve below the base");
         assert_eq!(resolved.as_str(), "Deeper/leaf.txt");
-    }
-
-    #[tokio::test]
-    async fn names_answers_with_the_case_variation_it_was_given() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
-
-        assert_eq!(
-            names_folding_to(dir.path(), "Test.file")
-                .await
-                .expect("a name the filesystem holds must resolve"),
-            vec!["Test.file".to_string()]
-        );
-    }
-
-    /// The reason the helper exists: a caller holding a name in one case needs the one the
-    /// filesystem kept. The directory is read and the names compared here rather than looked up,
-    /// so the case variation on disk is reported whether or not the filesystem would itself
-    /// have found the file under the one asked about.
-    #[tokio::test]
-    async fn names_answers_with_the_stored_case_variation() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
-
-        assert_eq!(
-            names_folding_to(dir.path(), "test.FILE")
-                .await
-                .expect("a case variation must resolve"),
-            vec!["Test.file".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn names_reports_a_name_that_is_not_there_in_any_case() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
-
-        assert!(
-            names_folding_to(dir.path(), "other.file")
-                .await
-                .expect("reading the directory must succeed")
-                .is_empty(),
-            "a name no case variation of which is there must not resolve"
-        );
-    }
-
-    /// Win32 trims trailing dots and spaces from a path before it looks it up, so asking about a
-    /// name with one can be answered about the neighbouring name. That is a different file, and
-    /// must not be reported as a case variation of the name asked about.
-    #[tokio::test]
-    async fn names_does_not_answer_with_a_neighbouring_name() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
-
-        assert!(
-            names_folding_to(dir.path(), "Test.file.")
-                .await
-                .expect("reading the directory must succeed")
-                .is_empty(),
-            "a trailing dot names a file that is not there"
-        );
-    }
-
-    /// Where variations can coexist, every one of them comes back — resolving that ambiguity is
-    /// the caller's to do — while an exact match answers for itself alone. Only a case-sensitive
-    /// filesystem can hold the two files this needs.
-    #[tokio::test]
-    async fn names_reports_every_case_variation_that_coexists() {
-        let dir = temp_dir();
-        if case_insensitive(dir.path()) {
-            return;
-        }
-        std::fs::write(dir.path().join("Test.file"), b"").expect("write Test.file");
-        std::fs::write(dir.path().join("test.file"), b"").expect("write test.file");
-
-        let mut found = names_folding_to(dir.path(), "TEST.FILE")
-            .await
-            .expect("the variations must resolve");
-        found.sort();
-        assert_eq!(
-            found,
-            vec!["Test.file".to_string(), "test.file".to_string()],
-            "an ambiguous name must report every case variation, not pick one"
-        );
-
-        assert_eq!(
-            names_folding_to(dir.path(), "test.file")
-                .await
-                .expect("an exact name must resolve"),
-            vec!["test.file".to_string()],
-            "a case variation the filesystem holds answers for itself, ambiguity or not"
-        );
     }
 
     /// A path is resolved a component at a time, so an ancestor in the wrong case has to be
@@ -1791,12 +1169,6 @@ mod tests {
                 "{asked} must resolve the same with the map as without it"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn all_names_exist_is_false_for_an_unreadable_directory() {
-        let dir = temp_dir();
-        assert!(!filesystem_names_all_exist(&dir.path().join("absent"), &["any"]).await);
     }
 
     const EXEC: u16 = NodeFileMode::Executable.bits();

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::WrapInternal;
@@ -21,7 +22,6 @@ use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
 use crate::immutable;
-use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
@@ -77,6 +77,18 @@ pub struct SwfsOperation {
     os: OsOperation,
 }
 
+impl SwfsOperation {
+    /// Thaws the frozen filesystem, clearing the write cache where the operation wrote.
+    pub(crate) async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
+        let token = SwfsExecutionToken {};
+        self.mount
+            .thaw(token, changes_made)
+            .await
+            .internal("Thawing SWFS file system")?;
+        Ok(())
+    }
+}
+
 macro_rules! fake_with_os {
     ($fn_name:ident, $result_ty:ty, $($arg_name:ident: $arg_ty:ty),* $(,)?) => {
         async fn $fn_name(&self, $($arg_name: $arg_ty),*) -> Result<$result_ty, FsError> {
@@ -107,9 +119,7 @@ impl InstanceOperation for SwfsOperation {
         Ok(())
     }
 
-    async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
-        Ok(())
-    }
+    fake_with_os!(write_file, (), path: &RelativePath, contents: Bytes);
 
     async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
         Ok(())
@@ -129,15 +139,6 @@ impl InstanceOperation for SwfsOperation {
         Ok((Fragment::default(), None))
     }
 
-    async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        let token = SwfsExecutionToken {};
-        self.mount
-            .thaw(token, changes_made)
-            .await
-            .internal("Thawing SWFS file system")?;
-        Ok(())
-    }
-
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
@@ -145,7 +146,7 @@ impl InstanceOperation for SwfsOperation {
         self.os.changes_from_filesystem_to_state(diff)
     }
 
-    fake_with_os!(unify_case_rename, (),
+    fake_with_os!(rename, (),
         _from: &RelativePath,
         _to: &RelativePath,
     );
@@ -161,23 +162,9 @@ impl InstanceOperation for SwfsOperation {
         _destination_path: &RelativePath,
     );
 
-    fake_with_os!(merge3_text_by_path, bool,
-        _base: &RelativePath,
-        _mine: &RelativePath,
-        _theirs: &RelativePath,
-        _result: &RelativePath,
-        _mode: MergeTextMode<'_>,
-    );
-
-    fake_with_os!(infer_is_diffable, bool, _path: &RelativePath,);
-
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         self.os.holds_name_exactly(path).await
     }
-
-    fake_with_os!(names_folding_to, Vec<String>,
-        _path: &RelativePath,
-        name: &str);
 
     fake_with_os!(read_directory, DirectoryListing, _path: &RelativePath,);
 

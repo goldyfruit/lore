@@ -1992,15 +1992,15 @@ async fn verify_diff_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
-    changes: &Arc<Vec<NodeChange>>,
-    conflicts: &Arc<Vec<(NodeChange, NodeChange)>>,
+    changes: &mut [NodeChange],
+    conflicts: &mut [(NodeChange, NodeChange)],
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
     verify_changes_against_filesystem(
         operation,
         repository,
         state_current,
-        changes.iter(),
+        changes.iter_mut().collect(),
         merge_type,
     )
     .await?;
@@ -2008,7 +2008,10 @@ async fn verify_diff_against_filesystem(
         operation,
         repository,
         state_current,
-        conflicts.iter().map(|(_, change_to)| change_to),
+        conflicts
+            .iter_mut()
+            .map(|(_, change_to)| change_to)
+            .collect(),
         merge_type,
     )
     .await?;
@@ -2018,40 +2021,46 @@ async fn verify_diff_against_filesystem(
 
 /// Verify one set of changes, reporting the first failure once every task in flight has
 /// drained: a task is reading the working copy and has to finish reading it.
-async fn verify_changes_against_filesystem<'a>(
+///
+/// What the verify settles on a change is carried back onto it, since the merge realizes every
+/// change it verified rather than the ones the working copy still needs.
+async fn verify_changes_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
-    changes: impl Iterator<Item = &'a NodeChange>,
+    mut changes: Vec<&mut NodeChange>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
     fn collect(
-        joined: Result<Result<Option<NodeChange>, MergeError>, tokio::task::JoinError>,
+        joined: Result<Result<(usize, change::Flags), MergeError>, tokio::task::JoinError>,
+        changes: &mut [&mut NodeChange],
         failure: &mut Option<MergeError>,
     ) {
         let result = joined
             .map_err(|e| MergeError::internal_with_context(e, "task failure"))
             .and_then(|result| result);
-        if let Err(err) = result {
-            *failure = failure.take().or(Some(err));
+        match result {
+            Ok((index, flags)) => changes[index].flags = flags,
+            Err(err) => *failure = failure.take().or(Some(err)),
         }
     }
 
     let stats = Arc::new(sync::SyncVerifyStats::default());
     let mut tasks = JoinSet::new();
     let mut failure = None;
-    for change in changes {
+    for index in 0..changes.len() {
+        let change = changes[index].clone();
         lore_spawn!(tasks, {
             let stats = stats.clone();
-            let change = change.clone();
             let repository = repository.clone();
             let operation = operation.clone();
             let state_current = state_current.clone();
             async move {
+                let mut change = change;
                 let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
                 let no_force_hash_check = false;
                 Box::pin(crate::fs::realize::verify_filesystem(
-                    change,
+                    &mut change,
                     repository.clone(),
                     operation,
                     crate::state::NodeMapping::root(repository, state_current),
@@ -2061,17 +2070,19 @@ async fn verify_changes_against_filesystem<'a>(
                     FilterMode::Full,
                 ))
                 .await
-                .forward::<MergeError>("verifying filesystem for change")
+                .forward::<MergeError>("verifying filesystem for change")?;
+
+                Ok((index, change.flags))
             }
         });
         while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(joined) = tasks.join_next().await
         {
-            collect(joined, &mut failure);
+            collect(joined, &mut changes, &mut failure);
         }
     }
     while let Some(joined) = tasks.join_next().await {
-        collect(joined, &mut failure);
+        collect(joined, &mut changes, &mut failure);
     }
     match failure {
         Some(err) => Err(err),
@@ -2295,22 +2306,24 @@ pub async fn apply_diff(
     // non-link contexts. For a link context the set is unfiltered and the
     // diff paths are link-root-relative.
     let stats = Arc::new(sync::SyncRealizeStats::default());
-    let changes = Arc::new(diff.changes);
-    let conflicts = Arc::new(diff.conflicts);
+    let mut changes = diff.changes;
+    let mut conflicts = diff.conflicts;
     let dry_run = execution_context().globals().dry_run();
 
     // One operation covers the whole diff: every path it verifies and realizes is in the
     // same filesystem, and one opened per change would freeze and thaw it once per file.
-    with_operation(repository.file_system(), true, async |operation| {
+    let (changes, conflicts) = with_operation(repository.file_system(), async |operation| {
         verify_diff_against_filesystem(
             &operation,
             &repository,
             &state_current,
-            &changes,
-            &conflicts,
+            &mut changes,
+            &mut conflicts,
             merge_type,
         )
         .await?;
+        let changes = Arc::new(changes);
+        let conflicts = Arc::new(conflicts);
         apply_diff_grafts(&repository, &state_staged, &grafts).await?;
         link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
             .await
@@ -2328,7 +2341,9 @@ pub async fn apply_diff(
             stats: &stats,
             skip_filesystem: dry_run || skip_filesystem,
         })
-        .await
+        .await?;
+
+        Ok::<_, MergeError>((changes, conflicts))
     })
     .await?;
 
@@ -2352,7 +2367,7 @@ pub async fn apply_diff(
                 // Set file/revision metadata
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -2383,7 +2398,7 @@ pub async fn apply_diff(
 
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -2418,7 +2433,7 @@ pub async fn apply_diff(
 
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -3021,7 +3036,7 @@ pub async fn merge_abort(
     let dry_run = execution_context().globals().dry_run();
     // One operation covers the abort: the merge artifacts it removes and the changes it
     // reverts are in the same working tree.
-    let modified_times = with_operation(repository.file_system(), true, async |operation| {
+    let modified_times = with_operation(repository.file_system(), async |operation| {
         if !dry_run {
             for change in changes.iter() {
                 sync::unlink_merge_artifacts(&operation, change.path()).await;
@@ -3202,7 +3217,7 @@ pub async fn apply_restart_diff(
         let conflicts = Arc::new(conflicts);
 
         // One operation covers the restart, as it covers a whole diff application.
-        with_operation(repository.file_system(), true, async |operation| {
+        with_operation(repository.file_system(), async |operation| {
             restart_reset_conflicts(&operation, &repository, &conflicts, dry_run).await?;
             realize_diff_over_filesystem(RealizeDiff {
                 operation: &operation,
@@ -3826,7 +3841,7 @@ pub async fn merge_resolve(
     // One operation covers every path: resolving reads the working copy to tell a conflict
     // still marked up from one settled. Nothing is written: the resolution is recorded in the
     // staged state.
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         resolve_paths(
             &operation,
             &repository,
@@ -4200,30 +4215,16 @@ async fn merge_into_link(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
 
     let state_new = state_staged;
     state_new.reset_merge_conflict_flags();
@@ -4561,30 +4562,16 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
     lore_debug!("Rehashed state");
 
     let state_new = state_staged;

@@ -351,7 +351,8 @@ pub async fn test_scan_path_with_intent(
     .collect()
     .await
     .expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -395,7 +396,8 @@ pub async fn test_scan_streaming(
         changes.push(change);
     }
     stream.finish().await.expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -430,4 +432,21 @@ pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::Execut
             "test-user".to_string(),
         ),
     )
+}
+
+/// The action letter against the path for each change, as a walk's consumers read it.
+///
+/// The action is carried because two sides route a path by which of them admits it, and a path
+/// alone does not say which route it took.
+#[allow(dead_code)]
+pub fn test_reported(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.action.as_string_short().to_string(),
+                change.path().as_str().to_string(),
+            )
+        })
+        .collect()
 }
