@@ -128,7 +128,7 @@ pub async fn collect_live_addresses(
                 }
                 Ok(_) => lore_base::lore_debug!("GC mark: branch {branch_id} has no metadata hash"),
                 Err(err) => {
-                    return Err(format!("failed to load branch metadata for {branch_id}: {err}"));
+                    return Err(format!("failed to load branch metadata for {branch_id} in repository {id}: {err}"));
                 }
             }
 
@@ -146,15 +146,15 @@ pub async fn collect_live_addresses(
                 None,
             )
             .await
-            .map_err(|err| format!("failed to list revisions for {branch_id}: {err}"))?;
+            .map_err(|err| format!("failed to list revisions for branch {branch_id} in repository {id}: {err}"))?;
 
             // Belt and braces, and the part that makes this class of bug impossible rather than
             // merely fixed: if the walk still reports more to come, the mark is incomplete and
             // whatever it did not see would be collected. Refuse the pass instead.
             if revisions.has_more {
                 return Err(format!(
-                    "revision walk for branch {branch_id} was truncated; refusing to collect \
-                     against an incomplete mark"
+                    "revision walk for branch {branch_id} in repository {id} was truncated; \
+                     refusing to collect against an incomplete mark"
                 ));
             }
 
@@ -177,7 +177,7 @@ pub async fn collect_live_addresses(
                     Err(err) => {
                         // A revision we cannot read is a revision we cannot prove the
                         // reachability of, so the pass must not delete anything.
-                        return Err(format!("failed to load state for {revision}: {err}"));
+                        return Err(format!("failed to load state for revision {revision} on branch {branch_id} in repository {id}: {err}"));
                     }
                 };
 
@@ -191,7 +191,7 @@ pub async fn collect_live_addresses(
                         live.extend(addresses);
                     }
                     Err(err) => {
-                        return Err(format!("failed to collect fragments for {revision}: {err}"));
+                        return Err(format!("failed to collect fragments for revision {revision} on branch {branch_id} in repository {id}: {err}"));
                     }
                 }
             }
